@@ -1,55 +1,44 @@
-# Prerequisites
-*.d
-
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
+# various outputs and binaries
 *.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
+*.d
+*.o
+*.elf
+*.exe
+*.hex
+*.lst
+*.map
+*.obj
+*.out
 *.dll
 *.so
 *.so.*
 *.dylib
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+# MSDK build system cruft
+*project_defines.h
+*_empty_tmp_file.c
+*ln_args.txt
+*ar_args.txt
+*build/
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+# eclipse stuff that we don't want
+*.launch
+*.settings
+.metadata
+[Rr]elease
+[Dd]ebug
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# misc stuff we don't want to sneak in here
+*.DS_Store
+*metadata/
+*.log
+*__pycache__
+*.wav
+*/out/
+*.csv
+*.xyrs
+*.xml
+*.stackdump
 
-# debug information files
-*.dwo
+# ignore .vscode folders at the very root of the project, these are not supposed to be here
+/.vscode/
