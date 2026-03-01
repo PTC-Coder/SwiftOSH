@@ -87,10 +87,25 @@ When porting code from the original SwiftOne (STM32L4R9):
 
 ## ISR / Callback Safety Rules
 
-- `GetBatteryVoltage()` MUST NEVER be called from any ISR or HAL callback context. It uses `HAL_Delay(5)`, `MX_ADC1_Init()`, ADC calibration, and polling — all blocking. Calling it from an ISR stalls the USB interrupt and starves other operations
+- `GetBatteryVoltage()` MUST NEVER be called from any ISR or HAL callback context. It uses `HAL_Delay()` and blocking ADC polling — both illegal in ISR context. Calling it from an ISR stalls the USB interrupt and starves other operations
 - Battery voltage for USB GET_REPORT: use `g_CachedBatteryVoltage` (updated every 10s from the USB main loop)
 - Battery voltage for recording mode: call `GetBatteryVoltage()` from task context only (e.g., `InitializeFATTask` before recording starts)
 - Do NOT call `HAL_LPTIM_SetOnce_Start_IT()` or any HAL init function from within `HAL_LPTIM_AutoReloadMatchCallback` — re-arming LPTIM from its own ISR can cause re-entrancy issues
+
+## ADC / Battery Voltage Rules (CRITICAL)
+
+- **Pin mapping**: VBAT_SCALED = PA0 = ADC1_IN5. VBUS_SCALED = PA15 (USB detect, NOT an ADC pin)
+- **Enable pin**: `VBAT_MONITOR_EN` (PB5, active-high) enables the battery voltage divider. Drive HIGH before reading, LOW after. `ADC_EN` (PB15) is for codec power in recording mode only — NOT needed for battery reads
+- **GPIO mode**: PA0 MUST be configured as `GPIO_MODE_ANALOG` with `GPIO_NOPULL` — done in both `MX_GPIO_Init()` and `HAL_ADC_MspInit()`. If PA0 is left in digital mode, the ADC input is invalid
+- **Voltage scaling**: divider ratio = 10/(10+33) = 0.2326. Formula: `battery_v = (raw * 3.3f / 4095.0f) * 4.298f`
+- **ADC clock**: use `ADC_CLOCK_ASYNC_DIV4` (160MHz/4 = 40MHz). STM32U5 ADC1 has no `ADC_CLOCK_SYNC_PCLK_DIV4` — only `ADC_CLOCK_ASYNC_DIVx` constants exist. ADC1 clock must be 5–55 MHz
+- **Init once**: call `MX_ADC1_Init()` once at startup in both USB and recording mode `main()` paths. Do NOT call it inside `GetBatteryVoltage()` on every read
+- **No calibration after init**: `HAL_ADC_Init()` exits DEEPPWD, enables ADVREGEN, and leaves ADC fully enabled (ADEN=1). `HAL_ADCEx_Calibration_Start()` requires ADEN=0 — calling it after `HAL_ADC_Init()` always returns HAL_ERROR. Do NOT attempt calibration in `GetBatteryVoltage()`
+- **Correct sequence**: `HAL_ADC_Start()` → `HAL_ADC_PollForConversion(100)` → `HAL_ADC_GetValue()` → `HAL_ADC_Stop()`
+- **No DeInit**: do NOT call `HAL_ADC_DeInit()` after each read — it disables the ADC clock and requires full re-init
+- **`__HAL_RCC_ADCDAC_CLK_ENABLE()` does NOT exist** in HAL V1.7.0 — use `__HAL_RCC_ADC12_CLK_ENABLE()` in `HAL_ADC_MspInit`
+- **PCSEL register**: STM32U5 ADC1/ADC2 require channels pre-selected in `PCSEL` register. `HAL_ADC_ConfigChannel()` handles this automatically — do not set PCSEL manually
+- **Known issue**: `HAL_ADC_PollForConversion` returns HAL_TIMEOUT despite clock running and `HAL_ADC_Start` returning HAL_OK. Root cause unresolved. Diagnostic log `<ADC> clk=... CR=0x... ISR=0x...` is in `GetBatteryVoltage()` — collect this from hardware to identify the failure
 
 ## STM32CubeIDE Debug Configuration
 
@@ -232,6 +247,7 @@ STM32U5 has a completely different peripheral memory map from STM32L4/F4. Do NOT
 
 ## What Still Needs Porting
 
+- Battery voltage ADC reading — `HAL_ADC_PollForConversion` times out (HAL_TIMEOUT), raw=0. Clock confirmed running at 160MHz, start returns HAL_OK. PA0 configured as analog, `__HAL_RCC_ADC12_CLK_ENABLE()` called in MspInit, PCSEL set automatically by `HAL_ADC_ConfigChannel()`. CR/ISR register values not yet captured from hardware — next step is reading the diagnostic log (`<ADC> clk=... CR=0x... ISR=0x...`) to identify root cause
 - SD firmware update (SD_FW_Update)
 
 ## USB Middleware Modifications

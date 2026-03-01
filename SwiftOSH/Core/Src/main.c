@@ -66,9 +66,19 @@ osThreadId ButtonHandle;
 #define BUTTON_PRESS_SIGNAL   ( 1 << 18 )  /* raw ISR event — ButtonTask checks hold duration */
 
 /* ---- DMA audio buffer ---- */
+/* BUFFER_SIZE is in bytes. DMA element count = BUFFER_SIZE / 2 (halfwords).
+   Half-complete fires at BUFFER_SIZE_DIV2 bytes = BUFFER_SIZE/4 halfwords. */
 #define BUFFER_SIZE       32768
 #define BUFFER_SIZE_DIV2  (BUFFER_SIZE / 2)
-static uint8_t I2SRxBuffer[BUFFER_SIZE] __attribute__((section(".bss")));
+uint8_t I2SRxBuffer[BUFFER_SIZE] __attribute__((section(".bss")));
+
+/* ---- DMA linked-list objects for circular SAI1 RX ---- */
+/* Two nodes needed: GPDMA linked-list mode has no half-transfer interrupt.
+   Node1 transfers first half → TC fires (half-complete callback).
+   Node2 transfers second half → TC fires (full-complete callback). */
+DMA_NodeTypeDef  SAI_DMA_Node1 __attribute__((aligned(32)));
+DMA_NodeTypeDef  SAI_DMA_Node2 __attribute__((aligned(32)));
+DMA_QListTypeDef SAI_DMA_Queue;
 
 /* ---- Stop-2 gate (same logic as original) ---- */
 volatile uint8_t g_initComplete = 0;
@@ -119,6 +129,11 @@ static void WriteDebugFile(void);
 
 static void AudioTransferComplete(SAI_HandleTypeDef *hsai);
 static void AudioTransferHalfComplete(SAI_HandleTypeDef *hsai);
+static void SAI_ErrorDiag(SAI_HandleTypeDef *hsai);
+
+/* Set from ISR, logged from task context to avoid flash writes in ISR */
+static volatile uint32_t g_saiErrorCode;
+static volatile uint32_t g_dmaErrorCode;
 
 float GetBatteryVoltage(void);
 void  USB_HID_ProcessFlash(void);
@@ -199,6 +214,7 @@ void SystemClock_Config(void)
   PeriphClkInit.PLL2.PLL2R = 8;
   PeriphClkInit.PLL2.PLL2RGE    = RCC_PLLVCIRANGE_1;
   PeriphClkInit.PLL2.PLL2FRACN  = 0;
+  PeriphClkInit.PLL2.PLL2ClockOut = RCC_PLL2_DIVP;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
     Error_Handler();
 }
@@ -308,19 +324,19 @@ static void MX_ADC1_Init(void)
   ADC_ChannelConfTypeDef sConfig = {0};
 
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler        = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.ClockPrescaler        = ADC_CLOCK_ASYNC_DIV4;  /* 160MHz/4 = 40MHz, within 50MHz max */
   hadc1.Init.Resolution            = ADC_RESOLUTION_12B;
   hadc1.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
   hadc1.Init.ScanConvMode          = ADC_SCAN_DISABLE;
   hadc1.Init.EOCSelection          = ADC_EOC_SINGLE_CONV;
-  hadc1.Init.LowPowerAutoWait     = ENABLE;
+  hadc1.Init.LowPowerAutoWait      = DISABLE;
   hadc1.Init.ContinuousConvMode    = DISABLE;
   hadc1.Init.NbrOfConversion       = 1;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
   hadc1.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.Overrun               = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.Overrun               = ADC_OVR_DATA_OVERWRITTEN;
   hadc1.Init.OversamplingMode      = DISABLE;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
     Error_Handler();
@@ -380,8 +396,24 @@ static void MX_LPTIM1_Init(void)
 
 static void MX_SAI1_Init(uint32_t AudioSampleRate)
 {
-  /* SAI1 Block A — master receiver, I2S-like, 16-bit stereo
-     PA8=BCLK, PA9=WCLK, PA10=DOUT(SD_A), PB8=MCLK */
+  /* SAI1 Block A — master receiver, standard I2S slave protocol
+     PA8=BCLK, PA9=WCLK(FSYNC), PA10=DOUT(SD_A), PB8=MCLK
+     
+     TLV320ADC3120 I2S timing (datasheet Fig 8-5):
+       - FSYNC falls → 1 BCLK idle → MSB of left channel (slot 0)
+       - FSYNC rises → 1 BCLK idle → MSB of right channel (slot 1)
+       - Data transmitted on falling BCLK edge → SAI samples on rising edge
+     
+     SAI free-protocol settings for standard I2S:
+       - FSOffset = SAI_FS_BEFOREFIRSTBIT: FSYNC goes active 1 BCLK before data
+       - FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION: FS low=left, FS high=right
+       - FSPolarity = SAI_FS_ACTIVE_LOW: left channel when FSYNC is low (standard I2S)
+       - ClockStrobing = SAI_CLOCKSTROBING_RISINGEDGE: sample on rising BCLK (codec outputs on falling)
+       - FrameLength = 64: 2 slots × 32 bits = 64 BCLK per frame
+       - ActiveFrameLength = 32: FSYNC low for 32 BCLK (left half-frame)
+       - SlotActive = both slots: receive left (slot 0) and right (slot 1)
+       - FirstBitOffset = 0: data starts immediately after the 1-BCLK FSYNC offset
+  */
   hsai_BlockA1.Instance            = SAI1_Block_A;
   hsai_BlockA1.Init.Protocol       = SAI_FREE_PROTOCOL;
   hsai_BlockA1.Init.AudioMode      = SAI_MODEMASTER_RX;
@@ -389,26 +421,31 @@ static void MX_SAI1_Init(uint32_t AudioSampleRate)
   hsai_BlockA1.Init.FirstBit       = SAI_FIRSTBIT_MSB;
   hsai_BlockA1.Init.ClockStrobing  = SAI_CLOCKSTROBING_RISINGEDGE;
   hsai_BlockA1.Init.Synchro        = SAI_ASYNCHRONOUS;
-  hsai_BlockA1.Init.OutputDrive    = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockA1.Init.OutputDrive    = SAI_OUTPUTDRIVE_ENABLE;
   hsai_BlockA1.Init.NoDivider      = SAI_MASTERDIVIDER_ENABLE;
   hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
   hsai_BlockA1.Init.FIFOThreshold  = SAI_FIFOTHRESHOLD_EMPTY;
   hsai_BlockA1.Init.AudioFrequency = AudioSampleRate;
   hsai_BlockA1.Init.SynchroExt     = SAI_SYNCEXT_DISABLE;
-  hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockA1.Init.MonoStereoMode = SAI_MONOMODE;  /* Only left slot (slot 0) written to DMA buffer */
   hsai_BlockA1.Init.CompandingMode = SAI_NOCOMPANDING;
   hsai_BlockA1.Init.PdmInit.Activation  = DISABLE;
   hsai_BlockA1.Init.PdmInit.MicPairsNbr = 0;
   hsai_BlockA1.Init.PdmInit.ClockEnable = SAI_PDM_CLOCK1_ENABLE;
+
+  /* Frame: 64 BCLK total, FSYNC low for 32 BCLK (left half), standard I2S offset */
   hsai_BlockA1.FrameInit.FrameLength       = 64;
   hsai_BlockA1.FrameInit.ActiveFrameLength = 32;
-  hsai_BlockA1.FrameInit.FSDefinition      = SAI_FS_STARTFRAME;
+  hsai_BlockA1.FrameInit.FSDefinition      = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockA1.FrameInit.FSPolarity        = SAI_FS_ACTIVE_LOW;
-  hsai_BlockA1.FrameInit.FSOffset          = SAI_FS_FIRSTBIT;
-  hsai_BlockA1.SlotInit.FirstBitOffset = 1;
+  hsai_BlockA1.FrameInit.FSOffset          = SAI_FS_BEFOREFIRSTBIT;
+
+  /* Slots: 2 × 32-bit, both active, data starts at bit 0 of slot */
+  hsai_BlockA1.SlotInit.FirstBitOffset = 0;
   hsai_BlockA1.SlotInit.SlotSize       = SAI_SLOTSIZE_32B;
   hsai_BlockA1.SlotInit.SlotNumber     = 2;
-  hsai_BlockA1.SlotInit.SlotActive     = 0x00000002;
+  hsai_BlockA1.SlotInit.SlotActive     = SAI_SLOTACTIVE_0 | SAI_SLOTACTIVE_1;
+
   if (HAL_SAI_Init(&hsai_BlockA1) != HAL_OK)
     Error_Handler();
 }
@@ -565,22 +602,23 @@ float GetBatteryVoltage(void)
 {
   float battery_v = -1.0f;
 
-  /* Enable battery voltage divider */
+  /* Enable battery voltage divider, allow settling */
   HAL_GPIO_WritePin(VBAT_MONITOR_GPIO_Port, VBAT_MONITOR_Pin, GPIO_PIN_SET);
-  HAL_Delay(5);  /* settling time */
+  HAL_Delay(10);
 
-  MX_ADC1_Init();
+  /* ADC is initialized once at startup — just start/poll/read/stop */
+  HAL_StatusTypeDef start_status = HAL_ADC_Start(&hadc1);
+  HAL_StatusTypeDef poll_status  = HAL_ADC_PollForConversion(&hadc1, 100);
 
   uint16_t raw = 0;
-  HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
-  HAL_ADC_Start(&hadc1);
-  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+  if (poll_status == HAL_OK)
   {
     raw = HAL_ADC_GetValue(&hadc1);
-    /* Scale: 12-bit ADC, 3.3V ref, resistor divider ratio ~3.778 */
-    battery_v = (raw * 3.3f / 4095.0f) * 3.778f;
+    /* Divider ratio 10/(10+33) = 0.2326, so Vin = (raw/4095)*3.3/0.2326 */
+    battery_v = (raw * 3.3f / 4095.0f) * 4.298f;
   }
-  HAL_ADC_DeInit(&hadc1);
+
+  HAL_ADC_Stop(&hadc1);
 
   /* Disable voltage divider to save power */
   HAL_GPIO_WritePin(VBAT_MONITOR_GPIO_Port, VBAT_MONITOR_Pin, GPIO_PIN_RESET);
@@ -588,10 +626,40 @@ float GetBatteryVoltage(void)
   return battery_v;
 }
 
+
 /* ================================================================== */
 /*                     SAI DMA CALLBACKS                              */
 /* ================================================================== */
 
+/* GPDMA linked-list mode has no half-transfer interrupt. We use two nodes:
+   Node1 → first half, Node2 → second half. Both generate TC events.
+   This custom DMA callback checks which node just completed and signals
+   the appropriate FreeRTOS event. Toggle flag tracks position in cycle. */
+static volatile uint8_t g_dmaHalfToggle = 0;
+
+static void DMA_SAI_XferCpltCallback(DMA_HandleTypeDef *hdma)
+{
+  (void)hdma;
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+  if (g_dmaHalfToggle == 0)
+  {
+    /* Node1 just completed → first half of buffer is ready */
+    xEventGroupSetBitsFromISR(xEventGroup, WRITEBUFFER1_SIGNAL, &xHigherPriorityTaskWoken);
+    g_dmaHalfToggle = 1;
+  }
+  else
+  {
+    /* Node2 just completed → second half of buffer is ready */
+    xEventGroupSetBitsFromISR(xEventGroup, WRITEBUFFER2_SIGNAL, &xHigherPriorityTaskWoken);
+    g_dmaHalfToggle = 0;
+  }
+
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+/* NOTE: These SAI callbacks are unused — GPDMA linked-list mode uses
+   DMA_SAI_XferCpltCallback instead. Kept for reference/fallback.
 static void AudioTransferComplete(SAI_HandleTypeDef *hsai)
 {
   (void)hsai;
@@ -606,6 +674,14 @@ static void AudioTransferHalfComplete(SAI_HandleTypeDef *hsai)
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   xEventGroupSetBitsFromISR(xEventGroup, WRITEBUFFER1_SIGNAL, &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+*/
+
+/* SAI error callback — captures error codes from ISR, logged from task context */
+static void SAI_ErrorDiag(SAI_HandleTypeDef *hsai)
+{
+  g_saiErrorCode = hsai->ErrorCode;
+  g_dmaErrorCode = hsai->hdmarx ? hsai->hdmarx->ErrorCode : 0xDEAD;
 }
 
 /* ================================================================== */
@@ -892,8 +968,37 @@ void RecordLoopTask(void const *argument)
                BUTTON_SIGNAL | ALARM_A_SIGNAL | END_OF_DAY_SIGNAL |
                DST_EVENT_SIGNAL | NEW_VOICE_MEMO_SIGNAL |
                LOW_BATTERY_SIGNAL | ERROR_SIGNAL,
-               pdTRUE, pdFALSE, osWaitForever);
+               pdTRUE, pdFALSE, pdMS_TO_TICKS(5000));
     __HAL_RCC_SDMMC1_CLK_ENABLE();
+
+    /* Log any deferred SAI/DMA errors captured from ISR context */
+    if (g_saiErrorCode || g_dmaErrorCode)
+    {
+      char dbg[60];
+      snprintf(dbg, sizeof(dbg), "<SAI ERR> sai=0x%lX dma=0x%lX\r\n",
+               (unsigned long)g_saiErrorCode, (unsigned long)g_dmaErrorCode);
+      WriteSystemLog(dbg);
+      g_saiErrorCode = 0;
+      g_dmaErrorCode = 0;
+    }
+
+    /* No DMA signals after 5s timeout — log and keep waiting */
+    if (uxBits == 0)
+    {
+      char dbg[160];
+      snprintf(dbg, sizeof(dbg),
+               "<RecordLoop> timeout saiState=%d CR1=0x%08lX CCR=0x%08lX CSR=0x%08lX CBR1=0x%08lX SR=0x%08lX MISR=0x%08lX dmaErr=0x%lX\r\n",
+               (int)hsai_BlockA1.State,
+               (unsigned long)SAI1_Block_A->CR1,
+               (unsigned long)GPDMA1_Channel0->CCR,
+               (unsigned long)GPDMA1_Channel0->CSR,
+               (unsigned long)GPDMA1_Channel0->CBR1,
+               (unsigned long)SAI1_Block_A->SR,
+               (unsigned long)GPDMA1->MISR,
+               (unsigned long)hdma_sai1_a.ErrorCode);
+      WriteSystemLog(dbg);
+      continue;
+    }
 
     if (uxBits & LOW_BATTERY_SIGNAL)
     {
@@ -1287,17 +1392,114 @@ static void InitializeCodecAndDMA(void)
   /* Enable ADC power supply (PB15 active-high) before codec init */
   HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_SET);
 
+  /* Step 1: Configure codec registers (reset, wake, ASI format, channel enables).
+     PWR_CFG is NOT written yet — the codec PLL needs BCLK/FSYNC present when it
+     powers up. Writing PWR_CFG before SAI clocks start causes PLL lock failure. */
   __HAL_RCC_I2C1_CLK_ENABLE();
-  AudioCodec_Initialize(&hi2c1);
-  __HAL_RCC_I2C1_CLK_DISABLE();
+  MX_I2C1_Init();
+  HAL_StatusTypeDef codecRet = (HAL_StatusTypeDef)AudioCodec_Initialize(&hi2c1);
 
+  /* Log codec init result — remove once confirmed working */
+  {
+    char dbg[80];
+    snprintf(dbg, sizeof(dbg), "<CODEC> init=%d i2c=%d readback=0x%02X (expect 0x85)\r\n",
+             (int)codecRet, (int)g_codecI2cStatus, g_codecReadback);
+    WriteFlashNextEntry(dbg);
+  }
+
+  /* Step 2: Start SAI DMA — this enables BCLK and FSYNC from the SAI master.
+     
+     GPDMA linked-list mode: We use two nodes (first half / second half).
+     Both generate TC events, but there's no HT flag. We register a custom
+     DMA XferCpltCallback that uses a toggle to distinguish half vs complete.
+     
+     IMPORTANT: We CANNOT use HAL_SAI_Receive_DMA() because it overwrites
+     the pre-configured linked-list nodes. Instead we start DMA manually. */
   MX_GPDMA1_Init();
   MX_SAI1_Init(WAVFile.SampleRate ? WAVFile.SampleRate : 32000);
-  HAL_SAI_RegisterCallback(&hsai_BlockA1, HAL_SAI_RX_COMPLETE_CB_ID, AudioTransferComplete);
-  HAL_SAI_RegisterCallback(&hsai_BlockA1, HAL_SAI_RX_HALFCOMPLETE_CB_ID, AudioTransferHalfComplete);
-  HAL_SAI_Receive_DMA(&hsai_BlockA1, I2SRxBuffer, BUFFER_SIZE);
-}
 
+  /* Reset toggle before starting DMA */
+  g_dmaHalfToggle = 0;
+
+  /* Register custom DMA callback directly — bypasses SAI HAL's internal callbacks
+     which don't work correctly with two-node linked-list (no HT interrupt). */
+  hdma_sai1_a.XferCpltCallback = DMA_SAI_XferCpltCallback;
+
+  /* Start DMA manually — HAL_SAI_Receive_DMA would overwrite our node config.
+     HAL_DMAEx_List_Start_IT starts the linked-list DMA with interrupts enabled. */
+  HAL_StatusTypeDef dmaRx = HAL_DMAEx_List_Start_IT(&hdma_sai1_a);
+
+  /* Update SAI handle state for consistency */
+  hsai_BlockA1.State = HAL_SAI_STATE_BUSY_RX;
+
+  /* Enable SAI DMA request and start SAI */
+  SAI1_Block_A->CR1 |= SAI_xCR1_DMAEN;
+  __HAL_SAI_ENABLE(&hsai_BlockA1);
+
+  /* Step 3: Now that BCLK/FSYNC are running, power up the codec PLL + ADC.
+     Give the SAI a moment to start clocking before the codec PLL tries to lock. */
+  HAL_Delay(5);
+  AudioCodec_PowerUp(&hi2c1);
+  __HAL_RCC_I2C1_CLK_DISABLE();
+
+  /* Log DMA init results — remove once confirmed working */
+  {
+    char dbg[160];
+    snprintf(dbg, sizeof(dbg),
+             "<SAI> dmaRx=%d saiState=%d dmaMode=0x%lX CR1=0x%08lX toggle=%d\r\n",
+             (int)dmaRx,
+             (int)hsai_BlockA1.State,
+             (unsigned long)hdma_sai1_a.Mode,
+             (unsigned long)SAI1_Block_A->CR1,
+             (int)g_dmaHalfToggle);
+    WriteFlashNextEntry(dbg);
+
+    /* DMA channel register dump — diagnose why HT/TC callbacks never fire */
+    snprintf(dbg, sizeof(dbg),
+             "<DMA> CCR=0x%08lX CSR=0x%08lX CTR1=0x%08lX CTR2=0x%08lX CBR1=0x%08lX CSAR=0x%08lX CDAR=0x%08lX CLLR=0x%08lX\r\n",
+             GPDMA1_Channel0->CCR,
+             GPDMA1_Channel0->CSR,
+             GPDMA1_Channel0->CTR1,
+             GPDMA1_Channel0->CTR2,
+             GPDMA1_Channel0->CBR1,
+             GPDMA1_Channel0->CSAR,
+             GPDMA1_Channel0->CDAR,
+             GPDMA1_Channel0->CLLR);
+    WriteFlashNextEntry(dbg);
+
+    /* Node contents — verify nodes are configured correctly (two-node circular) */
+    snprintf(dbg, sizeof(dbg),
+             "<NODE1> [0]=0x%08lX [1]=0x%08lX [2]=0x%08lX [3]=0x%08lX [4]=0x%08lX [5]=0x%08lX addr=0x%08lX\r\n",
+             SAI_DMA_Node1.LinkRegisters[0], SAI_DMA_Node1.LinkRegisters[1],
+             SAI_DMA_Node1.LinkRegisters[2], SAI_DMA_Node1.LinkRegisters[3],
+             SAI_DMA_Node1.LinkRegisters[4], SAI_DMA_Node1.LinkRegisters[5],
+             (unsigned long)&SAI_DMA_Node1);
+    WriteFlashNextEntry(dbg);
+    snprintf(dbg, sizeof(dbg),
+             "<NODE2> [0]=0x%08lX [1]=0x%08lX [2]=0x%08lX [3]=0x%08lX [4]=0x%08lX [5]=0x%08lX addr=0x%08lX\r\n",
+             SAI_DMA_Node2.LinkRegisters[0], SAI_DMA_Node2.LinkRegisters[1],
+             SAI_DMA_Node2.LinkRegisters[2], SAI_DMA_Node2.LinkRegisters[3],
+             SAI_DMA_Node2.LinkRegisters[4], SAI_DMA_Node2.LinkRegisters[5],
+             (unsigned long)&SAI_DMA_Node2);
+    WriteFlashNextEntry(dbg);
+
+    /* SAI FIFO status — check if data is accumulating (FLVL bits in SR) */
+    snprintf(dbg, sizeof(dbg),
+             "<SAI_SR> SR=0x%08lX CR1=0x%08lX CR2=0x%08lX FRCR=0x%08lX SLOTR=0x%08lX\r\n",
+             SAI1_Block_A->SR,
+             SAI1_Block_A->CR1,
+             SAI1_Block_A->CR2,
+             SAI1_Block_A->FRCR,
+             SAI1_Block_A->SLOTR);
+    WriteFlashNextEntry(dbg);
+
+    /* PLL2 clock check — SAI1 source. If 0, PLL2 is not running → no BCLK */
+    uint32_t saiclk = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SAI1);
+    snprintf(dbg, sizeof(dbg), "<CLK> sai1=%lu RCC_CR=0x%08lX CFGR1=0x%08lX\r\n",
+             saiclk, RCC->CR, RCC->CFGR1);
+    WriteFlashNextEntry(dbg);
+  }
+}
 static void WriteSystemLog(const char *inputString)
 {
   char stringBuffer[200];
@@ -1564,14 +1766,20 @@ void NewVoiceMemoTask(void const *argument)
 
     __HAL_RCC_I2C1_CLK_ENABLE();
     AudioCodec_Initialize(&hi2c1);
-    __HAL_RCC_I2C1_CLK_DISABLE();
+
     RTC_AddTimeAndSetAlarmA();
 
     MX_GPDMA1_Init();
     MX_SAI1_Init(WAVFile.SampleRate ? WAVFile.SampleRate : 32000);
-    HAL_SAI_RegisterCallback(&hsai_BlockA1, HAL_SAI_RX_COMPLETE_CB_ID, AudioTransferComplete);
-    HAL_SAI_RegisterCallback(&hsai_BlockA1, HAL_SAI_RX_HALFCOMPLETE_CB_ID, AudioTransferHalfComplete);
-    HAL_SAI_Receive_DMA(&hsai_BlockA1, I2SRxBuffer, BUFFER_SIZE);
+    g_dmaHalfToggle = 0;
+    hdma_sai1_a.XferCpltCallback = DMA_SAI_XferCpltCallback;
+    HAL_DMAEx_List_Start_IT(&hdma_sai1_a);
+    hsai_BlockA1.State = HAL_SAI_STATE_BUSY_RX;
+    SAI1_Block_A->CR1 |= SAI_xCR1_DMAEN;
+    __HAL_SAI_ENABLE(&hsai_BlockA1);
+    HAL_Delay(5);
+    AudioCodec_PowerUp(&hi2c1);
+    __HAL_RCC_I2C1_CLK_DISABLE();
 
     while (LoopFlag)
     {
@@ -1745,6 +1953,7 @@ int main(void)
     MX_RTC_Init();
     MX_TIM6_Init();       /* HAL timebase - USB stack uses HAL_Delay */
     MX_GPIO_Init_USB();
+    MX_ADC1_Init();   /* init once — GetBatteryVoltage just does start/poll/read/stop */
     /* Pre-populate battery cache before USB enumerates so first GET_REPORT has a valid value */
     g_CachedBatteryVoltage = GetBatteryVoltage();
     MX_USB_DEVICE_Init();
@@ -1756,6 +1965,7 @@ int main(void)
     MX_RTC_Init();
     MX_TIM6_Init();       /* HAL timebase so HAL_Delay works */
     MX_GPIO_Init();
+    MX_ADC1_Init();   /* init once — GetBatteryVoltage just does start/poll/read/stop */
     MX_SDMMC1_SD_Init();
     MX_LPTIM1_Init();
 

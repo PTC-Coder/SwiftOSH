@@ -5,7 +5,12 @@
 #include "stm32u5xx_hal.h"
 
 unsigned char AudioCodec_Initialize(I2C_HandleTypeDef *hi2c);
+unsigned char AudioCodec_PowerUp(I2C_HandleTypeDef *hi2c);
 unsigned char AudioCodec_SleepMode(I2C_HandleTypeDef *hi2c);
 unsigned char AudioCodec_WakeFromSleep(I2C_HandleTypeDef *hi2c);
+
+/* Diagnostic variables for I2C verification */
+extern uint8_t g_codecReadback;
+extern HAL_StatusTypeDef g_codecI2cStatus;
 
 #endif /* __AudioCodec_H__ */

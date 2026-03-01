@@ -5,8 +5,17 @@
   ******************************************************************************
   */
 #include "main.h"
+#include <string.h>
 
 extern DMA_HandleTypeDef hdma_sai1_a;
+extern DMA_NodeTypeDef   SAI_DMA_Node1;
+extern DMA_NodeTypeDef   SAI_DMA_Node2;
+extern DMA_QListTypeDef  SAI_DMA_Queue;
+
+/* Buffer size must match main.c */
+#define BUFFER_SIZE       32768
+#define BUFFER_SIZE_DIV2  (BUFFER_SIZE / 2)
+extern uint8_t I2SRxBuffer[];
 
 void HAL_MspInit(void)
 {
@@ -195,27 +204,75 @@ void HAL_SAI_MspInit(SAI_HandleTypeDef *hsai)
     g.Alternate = GPIO_AF13_SAI1;
     HAL_GPIO_Init(GPIOB, &g);
 
-    /* GPDMA1 Channel 0 for SAI1_A RX */
+    /* GPDMA1 Channel 0 for SAI1_A RX — linked-list circular mode.
+       STM32U5 GPDMA does not support DMA_CIRCULAR in Init.Mode.
+       Circular transfers require a linked-list queue with circular mode set.
+       
+       IMPORTANT: GPDMA linked-list mode has NO half-transfer interrupt.
+       We use TWO nodes, each transferring half the buffer:
+         Node1 → first half  → TC fires → HAL calls RxHalfCplt callback
+         Node2 → second half → TC fires → HAL calls RxCplt callback
+       The queue is circular: Node2 links back to Node1. */
     __HAL_RCC_GPDMA1_CLK_ENABLE();
-    hdma_sai1_a.Instance                 = GPDMA1_Channel0;
-    hdma_sai1_a.Init.Request             = GPDMA1_REQUEST_SAI1_A;
-    hdma_sai1_a.Init.BlkHWRequest        = DMA_BREQ_SINGLE_BURST;
-    hdma_sai1_a.Init.Direction            = DMA_PERIPH_TO_MEMORY;
-    hdma_sai1_a.Init.SrcInc               = DMA_SINC_FIXED;
-    hdma_sai1_a.Init.DestInc              = DMA_DINC_INCREMENTED;
-    hdma_sai1_a.Init.SrcDataWidth         = DMA_SRC_DATAWIDTH_HALFWORD;
-    hdma_sai1_a.Init.DestDataWidth        = DMA_DEST_DATAWIDTH_HALFWORD;
-    hdma_sai1_a.Init.Priority             = DMA_HIGH_PRIORITY;
-    hdma_sai1_a.Init.SrcBurstLength       = 1;
-    hdma_sai1_a.Init.DestBurstLength      = 1;
-    hdma_sai1_a.Init.TransferAllocatedPort = DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT1;
-    hdma_sai1_a.Init.TransferEventMode    = DMA_TCEM_BLOCK_TRANSFER;
-    hdma_sai1_a.Init.Mode                 = DMA_NORMAL;  /* TODO: circular DMA requires linked-list mode on STM32U5 GPDMA */
-    if (HAL_DMA_Init(&hdma_sai1_a) != HAL_OK)
+
+    /* Step 1: Init the DMA handle in linked-list mode */
+    hdma_sai1_a.Instance                         = GPDMA1_Channel0;
+    hdma_sai1_a.InitLinkedList.Priority          = DMA_HIGH_PRIORITY;
+    hdma_sai1_a.InitLinkedList.LinkStepMode      = DMA_LSM_FULL_EXECUTION;
+    hdma_sai1_a.InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT1;
+    hdma_sai1_a.InitLinkedList.TransferEventMode = DMA_TCEM_LAST_LL_ITEM_TRANSFER;
+    hdma_sai1_a.InitLinkedList.LinkedListMode    = DMA_LINKEDLIST_CIRCULAR;
+    if (HAL_DMAEx_List_Init(&hdma_sai1_a) != HAL_OK)
+      Error_Handler();
+
+    /* Step 2: Build TWO nodes — each transfers half the buffer.
+       Zero the nodes first to clear any stale state from a previous session. */
+    memset(&SAI_DMA_Node1, 0, sizeof(SAI_DMA_Node1));
+    memset(&SAI_DMA_Node2, 0, sizeof(SAI_DMA_Node2));
+
+    DMA_NodeConfTypeDef nodeConf = {0};
+    nodeConf.NodeType                         = DMA_GPDMA_LINEAR_NODE;
+    nodeConf.Init.Request                     = GPDMA1_REQUEST_SAI1_A;
+    nodeConf.Init.BlkHWRequest                = DMA_BREQ_SINGLE_BURST;
+    nodeConf.Init.Direction                   = DMA_PERIPH_TO_MEMORY;
+    nodeConf.Init.SrcInc                      = DMA_SINC_FIXED;
+    nodeConf.Init.DestInc                     = DMA_DINC_INCREMENTED;
+    nodeConf.Init.SrcDataWidth                = DMA_SRC_DATAWIDTH_HALFWORD;
+    nodeConf.Init.DestDataWidth               = DMA_DEST_DATAWIDTH_HALFWORD;
+    nodeConf.Init.SrcBurstLength              = 1;
+    nodeConf.Init.DestBurstLength             = 1;
+    nodeConf.Init.TransferAllocatedPort       = DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT1;
+    nodeConf.Init.TransferEventMode           = DMA_TCEM_EACH_LL_ITEM_TRANSFER;
+    nodeConf.Init.Mode                        = DMA_NORMAL;
+
+    /* Node 1: SAI1_A DR → first half of buffer (BUFFER_SIZE_DIV2 bytes = BUFFER_SIZE_DIV2/2 halfwords) */
+    nodeConf.SrcAddress = (uint32_t)&SAI1_Block_A->DR;
+    nodeConf.DstAddress = (uint32_t)&I2SRxBuffer[0];
+    nodeConf.DataSize   = BUFFER_SIZE_DIV2;  /* bytes */
+    if (HAL_DMAEx_List_BuildNode(&nodeConf, &SAI_DMA_Node1) != HAL_OK)
+      Error_Handler();
+
+    /* Node 2: SAI1_A DR → second half of buffer */
+    nodeConf.DstAddress = (uint32_t)&I2SRxBuffer[BUFFER_SIZE_DIV2];
+    nodeConf.DataSize   = BUFFER_SIZE_DIV2;  /* bytes */
+    if (HAL_DMAEx_List_BuildNode(&nodeConf, &SAI_DMA_Node2) != HAL_OK)
+      Error_Handler();
+
+    /* Step 3: Insert both nodes into queue and make it circular.
+       Reset queue first in case this is a re-init after Stop 2 wake-up. */
+    HAL_DMAEx_List_ResetQ(&SAI_DMA_Queue);
+    if (HAL_DMAEx_List_InsertNode_Tail(&SAI_DMA_Queue, &SAI_DMA_Node1) != HAL_OK)
+      Error_Handler();
+    if (HAL_DMAEx_List_InsertNode_Tail(&SAI_DMA_Queue, &SAI_DMA_Node2) != HAL_OK)
+      Error_Handler();
+    if (HAL_DMAEx_List_SetCircularMode(&SAI_DMA_Queue) != HAL_OK)
+      Error_Handler();
+
+    /* Step 4: Link the queue to the DMA handle */
+    if (HAL_DMAEx_List_LinkQ(&hdma_sai1_a, &SAI_DMA_Queue) != HAL_OK)
       Error_Handler();
 
     __HAL_LINKDMA(hsai, hdmarx, hdma_sai1_a);
-    __HAL_LINKDMA(hsai, hdmatx, hdma_sai1_a);
   }
 }
 
@@ -231,7 +288,7 @@ void HAL_SAI_MspDeInit(SAI_HandleTypeDef *hsai)
     }
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10);
     HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8);
-    HAL_DMA_DeInit(hsai->hdmarx);
-    HAL_DMA_DeInit(hsai->hdmatx);
+    HAL_DMAEx_List_DeInit(hsai->hdmarx);
+    HAL_DMAEx_List_ResetQ(&SAI_DMA_Queue);
   }
 }

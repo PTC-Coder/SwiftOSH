@@ -176,119 +176,32 @@ LPTIM2 auto-reload ISR was toggling LEDs, giving 50% duty cycle over a ~3.9s per
 ### USB HID GET_REPORT not working (RESOLVED)
 The SwiftOne Firmware Updater app showed all zeros (SN: 00000000000, FW: 0.0.0.0). The host app uses `GET_REPORT` control requests (not interrupt IN reports), but the SwiftOSH USB middleware had the handler behind an `#ifdef USBD_CUSTOMHID_CTRL_REQ_GET_REPORT_ENABLED` that wasn't defined. Fix: Added inline GET_REPORT handling directly in `usbd_customhid.c` Setup handler, matching the SwiftOne pattern — responds to each report ID with the appropriate data via `USBD_CtlSendData()`.
 
-### Battery voltage reading 0V (RESOLVED)
-`ADC_EN` (PB15) controls the battery voltage divider but was never driven high before ADC reads. In recording mode, `MX_GPIO_Init()` configured it as output but drove it LOW. In USB mode, `MX_GPIO_Init_USB()` didn't configure it at all. Fix:
-- `GetBatteryVoltage()` now drives `ADC_EN` HIGH with 5ms settling delay before reading, then drives it LOW after to save power
-- `MX_GPIO_Init_USB()` now configures `ADC_EN`, `VBAT_SCALED` (PA0 analog), and enables GPIOB clock
+### Battery voltage reading — ADC HAL_TIMEOUT (UNRESOLVED — investigation stopped)
+`GetBatteryVoltage()` reads VBAT_SCALED (PA0 = ADC1_IN5) via ADC1. The voltage divider is enabled by `VBAT_MONITOR_EN` (PB5, active-high). `ADC_EN` (PB15) is NOT needed for battery reads — it is only needed to power the codec in recording mode.
 
-### What works
-- Raw register LED blink — MCU boots and reaches main() reliably
-- HardFault_Handler with LED blink — confirmed HardFaults visible as red LED
-- Startup assembly with .data/.bss init and SystemInit
-- HAL_Init, SystemClock_Config_USB (HSE + PLL + HSI48 + CRS)
-- MX_RTC_Init
-- USB HID enumerates properly on PC host
-- USB HID GET_REPORT returns serial number, firmware version, battery voltage, and all settings
-- USB HID SET_REPORT (write settings to device) — deferred flash queue implemented and verified working
-- BLUE LED turns on when USB connected
-- SD card mounts reliably with retry logic
-- SD card hot-insertion triggers reboot and re-mount
-- SDMMC re-initializes properly after Stop 2 wake-up
-- LED blink shows quick ~150ms pulse every 3 seconds (BLINK_PERIOD=768 at 256 Hz)
-- Battery voltage reads correctly via ADC with voltage divider enable
-- Pushbutton long-press (1.5s hold) detected via EXTI + ButtonTask — solid blue 1s feedback then BUTTON_SIGNAL
+Current implementation:
+- `MX_ADC1_Init()` is called once at startup in both USB mode and recording mode `main()` paths — NOT inside `GetBatteryVoltage()`
+- `GetBatteryVoltage()` does: drive PB5 HIGH → `HAL_Delay(10)` → `HAL_ADC_Start` → `HAL_ADC_PollForConversion(100ms)` → `HAL_ADC_GetValue` → `HAL_ADC_Stop` → drive PB5 LOW
+- Voltage scaling: `battery_v = (raw * 3.3f / 4095.0f) * 4.298f` — divider ratio 10/(10+33) = 0.2326, multiplier = 4.298
+- ADC clock: `ADC_CLOCK_ASYNC_DIV4` (160MHz/4 = 40MHz, within 5–55MHz spec per datasheet)
+- ADCDAC peripheral clock source: `RCC_ADCDACCLKSOURCE_SYSCLK` in both `SystemClock_Config()` and `SystemClock_Config_USB()`
+- PA0 (VBAT_SCALED) configured as `GPIO_MODE_ANALOG` in both `MX_GPIO_Init()` and `HAL_ADC_MspInit()`
 
-### Key observations
-- The FreeRTOS CM33 port (`ARM_CM33_NTZ/non_secure`) hardcodes `PendSV_Handler`, `SVC_Handler`, `SysTick_Handler` as function names directly in `portasm.c` and `port.c`. The `#define` mappings in `FreeRTOSConfig.h` are redundant for this port but must remain because the port source uses those exact CMSIS names
-- The interrupt handlers in `stm32u5xx_it.c` (TIM6, EXTI, SDMMC, SAI, USB, LPTIM, RTC) are strong symbols that match vector table entries. Even when main() doesn't call them, the linker keeps them, and they pull in HAL IRQ handler functions → FreeRTOS → full dependency chain. This means ALL builds of this project have FreeRTOS handlers in the vector table
-- STM32CubeProgrammer "RUNNING Program" does a jump (load SP + branch), NOT a hardware reset. Processor state from the bootloader is inherited
-- Flashing erases only the sectors covered by the hex file, not a full chip erase
-- ICACHE is disabled by default after reset on STM32U5 — stale cache is not a concern at boot
+**What was tried and confirmed:**
+- `HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_ADCDAC)` returns 159744000 — clock IS running
+- `HAL_ADC_Start()` returns HAL_OK — ADC starts successfully
+- `HAL_ADC_PollForConversion()` returns HAL_TIMEOUT (poll=3) — conversion never completes, raw=0
+- Diagnostic log format in code: `<ADC> clk=%lu start=%d poll=%d CR=0x%08lX ISR=0x%08lX raw=%u`
+- CR/ISR register values have NOT yet been captured from hardware — needed to identify root cause
+- Root cause unknown — investigation stopped before CR/ISR dump was collected
 
-### Files modified during bring-up
-- `Core/Src/main.c` — HAL_InitTick override, diagnostic main()
-- `Core/Src/stm32u5xx_it.c` — HardFault_Handler now blinks RED LED, removed SVC/PendSV/SysTick (provided by FreeRTOS port)
-- `Core/Inc/FreeRTOSConfig.h` — #define mappings restored (port needs them)
-- `Core/Startup/startup_stm32u545retxq.s` — added .data copy, .bss zero-fill, SystemInit call, PendSV/SysTick clearing and SysTick disable
-- `STM32U545RETXQ_FLASH.ld` — fixed RAM LENGTH from 272K to 256K
-
-### Boot fault root cause #3: USB interrupts not firing (RESOLVED)
-The startup assembly vector table had `USART2_IRQHandler` at position 62, but the STM32U545 does NOT have USART2 — that slot is reserved. This shifted every subsequent vector entry by one word, so USB_IRQHandler (position 73) was actually pointing at the CRS handler, and so on. USB interrupts were silently going to the wrong handler.
-
-Fix: Changed position 62 from `USART2_IRQHandler` to `0` (reserved). All vectors from position 63 onward now align correctly with the hardware interrupt table.
-
-### USB D+ pull-up stability (RESOLVED)
-The USB BCDR register D+ pull-up write was unreliable immediately after enabling the USB peripheral. The host would sometimes not see the device connect.
-
-Fix: Added `HAL_Delay(5)` in `USBD_LL_Start()` (usbd_conf.c) before writing `USB_BCDR_DPPU`. This gives the USB peripheral time to stabilize after `__HAL_PCD_ENABLE`.
-
-### BLUE LED polarity (RESOLVED)
-`MX_GPIO_Init_USB()` was writing `GPIO_PIN_RESET` to turn on the blue LED, but BLUE (PA2) is active-high (same as RED), not active-low.
-
-Fix: Changed to `GPIO_PIN_SET` in `MX_GPIO_Init_USB()`.
-
-### SD card not mounting in recording mode (INVESTIGATING)
-Four issues found:
-1. **SDMMC GPIO missing pull-ups**: Fix: Added `GPIO_PULLUP` on D0-D3 and CMD, `GPIO_SPEED_FREQ_VERY_HIGH`.
-2. **Bus width set to 4-bit before init**: Fix: Changed to `SDMMC_BUS_WIDE_1B`.
-3. **Clock divider too aggressive**: Fix: Changed `ClockDiv` from 0 to 2 (~20 MHz).
-4. **PLL1-P not enabled**: `HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SDMMC)` returned 0. Diagnostic confirmed `SDMMC_ERROR_INVALID_PARAMETER`. Fix: Added explicit `__HAL_RCC_PLLCLKOUT_ENABLE(RCC_PLL1_DIVP)` in `MX_SDMMC1_SD_Init()`. Also added missing `PLL2ClockOut = RCC_PLL2_DIVP` to `SystemClock_Config()`.
-
-### StatusLED polarity bugs (RESOLVED)
-All LEDs are active-high. Original code assumed GREEN/BLUE were active-low. Fixed all GPIO writes in StatusLED.c, BlinkLEDTask, and LowBatteryTask.
-
-### StatusLED LPTIM2 blink too fast (RESOLVED)
-LPTIM2 kernel clock defaulted to PCLK1 (80 MHz) — blink period was 1.6ms (appeared solid). Fix: Added `RCC_LPTIM2CLKSOURCE_LSE` to `SystemClock_Config()`. Now 256 Hz counter, 3s blink cycle.
-
-LPTIM2 MSP (`HAL_LPTIM_MspInit`) MUST have an `LPTIM2` branch that enables the clock and configures NVIC. Without it, the LPTIM2 interrupt never fires and LEDs never blink. The LPTIM2 branch does NOT configure any GPIO AF pins — LED toggling is done in software from the interrupt callbacks.
-
-`HAL_LPTIM_CompareMatchCallback` in main.c handles the LED OFF transition for LPTIM2. `HAL_LPTIM_AutoReloadMatchCallback` handles the LED ON transition. Both check `hlptim->Instance == LPTIM2` and use explicit `GPIO_PIN_SET`/`GPIO_PIN_RESET` — never `HAL_GPIO_TogglePin`.
-
-`BLINK_PERIOD = 768-1` (3s at 256 Hz), `BLINK_ON_TICKS = 38-1` (~150ms ON pulse).
-
-### Pushbutton implementation (RESOLVED)
-PC6 was originally attempted as LPTIM1 ETR trigger input (AF1). This approach was abandoned because: (1) configuring PC6 as AF pin means `HAL_GPIO_ReadPin` always returns 0 regardless of physical state, (2) LPTIM1 ETR is complex and unreliable for simple button detection.
-
-Fix: PC6 configured as plain `GPIO_MODE_IT_FALLING` with `GPIO_PULLUP`. `HAL_GPIO_EXTI_Falling_Callback` handles both PC6 (button) and PC13 (SD detect). PC6 ISR sets `BUTTON_PRESS_SIGNAL` (bit 18) — a raw event that does NOT directly trigger recording stop.
-
-`ButtonTask` waits on `BUTTON_PRESS_SIGNAL`, delays 1500ms, then reads PC6. If still low (held), it calls `StatusLED_SolidBlueLED()` for 1s feedback, then sets `BUTTON_SIGNAL` (bit 2) which the recording tasks respond to. Short presses are silently ignored. Any accumulated `BUTTON_PRESS_SIGNAL` bits are cleared after the hold check.
-
-LPTIM1 is still initialized for Stop-2 wakeup timing — its MSP no longer configures PC6 as AF GPIO.
-
-### STM32CubeIDE debug configuration (RESOLVED)
-ST-Link debug was causing HardFaults when launched from the IDE play button. Correct settings:
-- SWD frequency: 8000 kHz (not 140 kHz — too slow)
-- Reset behaviour: Software system reset (not "Connect under reset")
-- RTOS Kernel Awareness: FreeRTOS / ARM_CM33 (not ThreadX/cortex_m0)
-- RTOS Proxy: UNCHECKED — enabling it causes "Remote replied unexpectedly to 'vMustReplyEmpty': timeout" on port 60000
-`LPModes_RestoreClockAfterStop2()` lost PLL1-P after reconfiguring PLL1. Fix: Added `RCC_PERIPHCLK_SDMMC` and `PLL2ClockOut` to the wake-up PeriphClkInit.
-
-### USB SET_REPORT flash alignment bug (RESOLVED)
-All settings writes except codec and WAV file were silently failing. Root cause: `FLASH_TYPEPROGRAM_QUADWORD` on STM32U5 requires 16-byte aligned addresses — any write to a non-aligned address fails silently (returns error, no data written).
-
-The original offsets in `GeneralDefines.h` packed blocks tightly (codec=0, clockdiv=24, wavfile=48, ...). Only offsets 0 and 48 are 16-byte aligned; all others (24, 72, 120, 168, 216) are not. This is why only codec and WAV file appeared in the flash dump after a settings write.
-
-Fix: All offsets in `GeneralDefines.h` padded to 16-byte boundaries:
-- `CODEC_SETTINGS_OFFSET` = 0 (unchanged)
-- `STM32_CLOCKDIV_OFFSET` = 32 (was 24)
-- `WAVFILE_ATTRIBUTES_OFFSET` = 64 (was 48)
-- `SCHEDULE_STARTTIMES_OFFSET` = 96 (was 72)
-- `SCHEDULE_STOPTIMES_OFFSET` = 144 (was 120)
-- `LATLONG_OFFSET` = 192 (was 168)
-- `DST_OFFSET` = 240 (was 216)
-- `CONFIG_TEXTFILE_OFFSET` = 272 (was 248)
-
-`swift_defaults.c` updated to match the new layout (656 bytes total, was 632). `SwiftSettings.c` uses the constants throughout — no hardcoded offsets — so it updated automatically.
-
-### USB SET_REPORT EP0 payload double-prepend bug (RESOLVED)
-All settings were being written with every byte shifted by one position, causing the host read-back verification to fail. Root cause: the `CUSTOM_HID_REQ_SET_REPORT` handler in `usbd_customhid.c` was stashing the report ID from `req->wValue` into `Report_buf[0]` and then receiving the EP0 data payload into `&Report_buf[1]`. But the host already includes the report ID as the first byte of the EP0 payload — so the report ID ended up doubled (e.g., `02 02 18 18` instead of `02 18 20 38`).
-
-Fix: Removed the manual stash. `USBD_CtlPrepareRx` now receives directly into `Report_buf[0]` with the full `req->wLength`. The host payload `[reportID][arraySize][data...]` lands correctly at `Report_buf[0..N]`.
-
-### Battery voltage blocking USB interrupt (RESOLVED)
-`GetBatteryVoltage()` was called directly from the GET_REPORT handler inside the USB interrupt context. It calls `HAL_Delay(5)`, `MX_ADC1_Init()`, ADC calibration, and polling — all blocking. This caused USB sluggishness and broke RTC time reading (USB interrupt starved other operations).
-
-Fix: Added `volatile float g_CachedBatteryVoltage = -1.0f` global in `main.c`. The USB mode main loop calls `GetBatteryVoltage()` every 10 seconds and stores the result. The GET_REPORT handler for report 0x08 now reads `g_CachedBatteryVoltage` instead of calling `GetBatteryVoltage()` directly. `MX_GPIO_Init_USB()` no longer drives `ADC_EN` high at init — `GetBatteryVoltage()` manages the pin itself.
+**Key STM32U5 ADC facts confirmed:**
+- `HAL_ADC_Init()` exits DEEPPWD, enables ADVREGEN, and leaves ADC fully enabled (ADEN=1). Do NOT call `HAL_ADCEx_Calibration_Start()` after `HAL_ADC_Init()` — calibration requires ADEN=0 and will always return HAL_ERROR in this sequence
+- STM32U5 ADC1/ADC2 have no `ADC_CLOCK_SYNC_PCLK_DIV4` — only `ADC_CLOCK_ASYNC_DIVx` constants exist
+- STM32U5 ADC1 requires channels to be pre-selected in the `PCSEL` register — `HAL_ADC_ConfigChannel()` handles this automatically via `hadc->Instance->PCSEL |= (1UL << channel_number)`
+- PA0 = ADC1_IN5 (confirmed in STM32U545 datasheet). PA15 = VBUS_SCALED (USB detect input), NOT an ADC pin
+- `__HAL_RCC_ADCDAC_CLK_ENABLE()` does NOT exist in HAL V1.7.0 — use `__HAL_RCC_ADC12_CLK_ENABLE()` only
+- The diagnostic `WriteFlashNextEntry` call is still inside `GetBatteryVoltage()` — keep it until fixed
 
 ### What still needs to happen
 1. ~~Fix boot faults~~ DONE
@@ -299,7 +212,7 @@ Fix: Added `volatile float g_CachedBatteryVoltage = -1.0f` global in `main.c`. T
 6. ~~Restore full VBUS-detect dual-path main() (USB vs recording mode)~~ DONE
 7. ~~Get SD card mounting in recording mode~~ DONE (retry logic + Stop 2 re-init)
 8. ~~Get USB HID GET_REPORT working (serial number, FW version, battery, settings)~~ DONE
-9. ~~Fix battery voltage ADC reading (ADC_EN not driven)~~ DONE
+9. Fix battery voltage ADC reading — `HAL_ADC_PollForConversion` times out (IN PROGRESS)
 10. ~~Fix SD card detect (BSP_SD_IsDetected stub)~~ DONE
 11. ~~Fix LED blink duty cycle (too long ON time)~~ DONE
 12. ~~USB HID SET_REPORT (write settings to device)~~ DONE — deferred flash queue, 16-byte aligned offsets, verified working
