@@ -423,7 +423,7 @@ static void MX_SAI1_Init(uint32_t AudioSampleRate)
   hsai_BlockA1.Init.Synchro        = SAI_ASYNCHRONOUS;
   hsai_BlockA1.Init.OutputDrive    = SAI_OUTPUTDRIVE_ENABLE;
   hsai_BlockA1.Init.NoDivider      = SAI_MASTERDIVIDER_ENABLE;
-  hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
+  hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_ENABLE;  /* OSR=1: doubles MCLK period for correct Fs */
   hsai_BlockA1.Init.FIFOThreshold  = SAI_FIFOTHRESHOLD_EMPTY;
   hsai_BlockA1.Init.AudioFrequency = AudioSampleRate;
   hsai_BlockA1.Init.SynchroExt     = SAI_SYNCEXT_DISABLE;
@@ -440,11 +440,12 @@ static void MX_SAI1_Init(uint32_t AudioSampleRate)
   hsai_BlockA1.FrameInit.FSPolarity        = SAI_FS_ACTIVE_LOW;
   hsai_BlockA1.FrameInit.FSOffset          = SAI_FS_BEFOREFIRSTBIT;
 
-  /* Slots: 2 × 32-bit, both active, data starts at bit 0 of slot */
+  /* Slots: 2 × 32-bit in frame, but only slot 0 (left/ch1) active for mono.
+     Codec outputs mono on channel 1 (slot 0 in I2S). Slot 1 is ignored. */
   hsai_BlockA1.SlotInit.FirstBitOffset = 0;
   hsai_BlockA1.SlotInit.SlotSize       = SAI_SLOTSIZE_32B;
   hsai_BlockA1.SlotInit.SlotNumber     = 2;
-  hsai_BlockA1.SlotInit.SlotActive     = SAI_SLOTACTIVE_0 | SAI_SLOTACTIVE_1;
+  hsai_BlockA1.SlotInit.SlotActive     = SAI_SLOTACTIVE_0;  /* Mono: only left channel */
 
   if (HAL_SAI_Init(&hsai_BlockA1) != HAL_OK)
     Error_Handler();
@@ -918,9 +919,9 @@ void InitializeFATTask(void const *argument)
   StandbyHandle = osThreadCreate(osThread(Standby), NULL);
   osThreadSuspend(StandbyHandle);
 
-  /* Init codec over I2C */
+  /* Init codec over I2C — probe only, puts codec to sleep after */
   MX_I2C1_Init();
-  AudioCodec_Initialize(&hi2c1);
+  AudioCodec_Initialize(&hi2c1, 0x00);  /* gain=0 for probe, not recording */
   AudioCodec_SleepMode(&hi2c1);
   __HAL_RCC_I2C1_CLK_DISABLE();
 
@@ -1391,19 +1392,22 @@ static void InitializeCodecAndDMA(void)
 
   /* Enable ADC power supply (PB15 active-high) before codec init */
   HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_SET);
+  HAL_Delay(10);  /* Allow codec to power up before I2C communication */
 
   /* Step 1: Configure codec registers (reset, wake, ASI format, channel enables).
      PWR_CFG is NOT written yet — the codec PLL needs BCLK/FSYNC present when it
      powers up. Writing PWR_CFG before SAI clocks start causes PLL lock failure. */
   __HAL_RCC_I2C1_CLK_ENABLE();
   MX_I2C1_Init();
-  HAL_StatusTypeDef codecRet = (HAL_StatusTypeDef)AudioCodec_Initialize(&hi2c1);
+  /* Gain from flash: CODEC_SETTINGS_OFFSET+3, 0.5dB/step (0x38 = 28dB) */
+  uint8_t codecGain = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 3);
+  if (codecGain == 0xFF) codecGain = 0x38;  /* default 28dB if unprogrammed */
+  HAL_StatusTypeDef codecRet = (HAL_StatusTypeDef)AudioCodec_Initialize(&hi2c1, codecGain);
 
   /* Log codec init result — remove once confirmed working */
   {
-    char dbg[80];
-    snprintf(dbg, sizeof(dbg), "<CODEC> init=%d i2c=%d readback=0x%02X (expect 0x85)\r\n",
-             (int)codecRet, (int)g_codecI2cStatus, g_codecReadback);
+    char dbg[60];
+    snprintf(dbg, sizeof(dbg), "<CODEC> init=%d gain=0x%02X\r\n", (int)codecRet, codecGain);
     WriteFlashNextEntry(dbg);
   }
 
@@ -1765,7 +1769,9 @@ void NewVoiceMemoTask(void const *argument)
     }
 
     __HAL_RCC_I2C1_CLK_ENABLE();
-    AudioCodec_Initialize(&hi2c1);
+    uint8_t codecGain = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 3);
+    if (codecGain == 0xFF) codecGain = 0x38;
+    AudioCodec_Initialize(&hi2c1, codecGain);
 
     RTC_AddTimeAndSetAlarmA();
 

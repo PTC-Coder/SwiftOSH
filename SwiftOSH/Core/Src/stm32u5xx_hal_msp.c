@@ -57,7 +57,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
     GPIO_InitTypeDef g = {0};
     g.Pin       = GPIO_PIN_6 | GPIO_PIN_7;  /* PB6=SCL, PB7=SDA */
     g.Mode      = GPIO_MODE_AF_OD;
-    g.Pull      = GPIO_NOPULL;
+    g.Pull      = GPIO_PULLUP;  /* Internal pull-ups for I2C */
     g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
     g.Alternate = GPIO_AF4_I2C1;
     HAL_GPIO_Init(GPIOB, &g);
@@ -220,7 +220,7 @@ void HAL_SAI_MspInit(SAI_HandleTypeDef *hsai)
     hdma_sai1_a.InitLinkedList.Priority          = DMA_HIGH_PRIORITY;
     hdma_sai1_a.InitLinkedList.LinkStepMode      = DMA_LSM_FULL_EXECUTION;
     hdma_sai1_a.InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT1;
-    hdma_sai1_a.InitLinkedList.TransferEventMode = DMA_TCEM_LAST_LL_ITEM_TRANSFER;
+    hdma_sai1_a.InitLinkedList.TransferEventMode = DMA_TCEM_EACH_LL_ITEM_TRANSFER;
     hdma_sai1_a.InitLinkedList.LinkedListMode    = DMA_LINKEDLIST_CIRCULAR;
     if (HAL_DMAEx_List_Init(&hdma_sai1_a) != HAL_OK)
       Error_Handler();

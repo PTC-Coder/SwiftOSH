@@ -22,10 +22,19 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - `g_LastWriteStatus`, `g_LastEraseStatus`, `g_LastFlashError` — debug globals for checking flash operation results
 
 ### AudioCodec (AudioCodec.h / AudioCodec.c)
-- `AudioCodec_Initialize(hi2c)` — configures TLV320ADC3120 via I2C using settings from flash
+- `AudioCodec_Initialize(hi2c, gain)` — configures TLV320ADC3120 via I2C
+  - `gain`: digital gain for CH1_CFG2, 0.5dB/step (0x00=0dB, 0x28=20dB, 0x38=28dB)
+  - Gain read from flash at `CODEC_SETTINGS_OFFSET + 3`, default 0x38 if unprogrammed
+- `AudioCodec_PowerUp(hi2c)` — powers up ADC, MICBIAS, PLL. **MUST be called AFTER SAI DMA starts** — codec PLL needs BCLK/FSYNC present to lock
 - `AudioCodec_SleepMode(hi2c)` — powers down ADC for low-power
 - `AudioCodec_WakeFromSleep(hi2c)` — re-enables ADC
-- Codec I2C address: 0x4D (7-bit), shifted to 0x9A for HAL
+- Codec I2C address: **0x4E (7-bit)**, shifted to 0x9C for HAL (ADDR pin tied high on SwiftOSH)
+- Key register configuration:
+  - `REG_SLEEP_CFG (0x02)`: Wake from sleep, enable AREG
+  - `REG_ASI_CFG0 (0x07)`: I2S format, 16-bit word length (0x30)
+  - `REG_CH1_CFG0 (0x3C)`: Single-ended input (0x20)
+  - `REG_BIAS_CFG (0x3B)`: MICBIAS voltage and ADC full-scale (default 0x00 = 2.75V)
+  - `REG_PWR_CFG (0x75)`: ADC power-up, MICBIAS enable, PLL enable
 
 ### RTC_Swift (RTC_Swift.h / RTC_Swift.c)
 - `RTC_SetDateTime(buffer)` — sets RTC date/time from USB HID buffer (BCD format)
@@ -118,6 +127,42 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - `LPModes_EnterStop2()` — Stop 2 entry with wake-up flag clearing (uses `PWR_WAKEUP_ALL_FLAG` and `PWR_FLAG_SBF`)
 - `LPModes_RestoreClockAfterStop2()` — restores HSE, PLL1, PLL2 (SAI1), SYSCLK after Stop 2
 - Gated by `g_initComplete` and `g_stop2Allowed` flags in main.c
+
+## SAI/DMA Audio Recording (CRITICAL)
+
+### GPDMA Linked-List Mode for Half-Transfer Simulation
+STM32U5 GPDMA does NOT support the `DMA_CIRCULAR` mode or half-transfer interrupt like STM32L4 DMA. To achieve double-buffering:
+
+1. **Two-node linked-list**: Create two DMA nodes, each transferring half the buffer (BUFFER_SIZE_DIV2 bytes)
+2. **Circular queue**: Node1 links to Node2, Node2 links back to Node1 via `HAL_DMAEx_List_SetCircularMode()`
+3. **TransferEventMode**: MUST be `DMA_TCEM_EACH_LL_ITEM_TRANSFER` in BOTH the handle init AND node config — fires TC after each node completes
+4. **Custom callback**: Register `hdma_sai1_a.XferCpltCallback` directly — toggle flag tracks which half completed:
+   ```c
+   if (g_dmaHalfToggle == 0) { signal WRITEBUFFER1; toggle = 1; }
+   else { signal WRITEBUFFER2; toggle = 0; }
+   ```
+
+### SAI Configuration for 32kHz Mono
+- **AudioFrequency**: 32000
+- **MckOverSampling**: `SAI_MCK_OVERSAMPLING_ENABLE` — doubles MCLK period for correct Fs calculation
+- **SlotActive**: `SAI_SLOTACTIVE_0` only — mono capture from slot 0 (left/ch1)
+- **MonoStereoMode**: `SAI_MONOMODE` — discards slot 1 data
+- **DataSize**: `SAI_DATASIZE_16` — matches codec ASI 16-bit word length
+- **ClockSource**: PLL2P at 32.768 MHz (configured in `SystemClock_Config`)
+
+### DMA Start Sequence (Order Matters!)
+1. `MX_GPDMA1_Init()` — init DMA handle
+2. `MX_SAI1_Init()` — configure SAI peripheral
+3. Register custom DMA callback: `hdma_sai1_a.XferCpltCallback = DMA_SAI_XferCpltCallback`
+4. `HAL_DMAEx_List_Start_IT(&hdma_sai1_a)` — start DMA with interrupts
+5. Enable SAI DMA request: `SAI1_Block_A->CR1 |= SAI_xCR1_DMAEN`
+6. Enable SAI: `__HAL_SAI_ENABLE(&hsai_BlockA1)`
+7. **THEN** call `AudioCodec_PowerUp()` — codec PLL needs BCLK/FSYNC present to lock
+
+**WARNING**: Do NOT use `HAL_SAI_Receive_DMA()` — it overwrites the two-node linked-list configuration with its own single-node setup.
+
+### Sample Rate Flash Settings Issue
+The TLV320ADC3120 uses different sample rate encoding than the old SwiftOne codec. The flash settings byte at `CODEC_SETTINGS_OFFSET + 2` contains old codec values. Currently forcing 32kHz in `SwiftSettings_GetWAVFileAttributes()` and `AudioFiles_WriteHeader()` until a translator is implemented.
 
 ## Adding New Drivers
 

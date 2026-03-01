@@ -2,8 +2,9 @@
 #ifndef __GeneralDefines_H
 #define __GeneralDefines_H
 
-/* TLV320ADC3120 I2C address (7-bit 0x4D, shifted for HAL) */
-#define CODEC_I2C_ADDRESS       (0x4D << 1)
+/* TLV320ADC3120 I2C address (7-bit 0x4E, shifted for HAL)
+   ADDR pin tied high on SwiftOSH board → address 0x4E */
+#define CODEC_I2C_ADDRESS       (0x4E << 1)
 
 /* Operating states */
 #define STANDBY    0

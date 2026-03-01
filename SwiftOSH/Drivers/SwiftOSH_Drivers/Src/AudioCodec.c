@@ -39,8 +39,9 @@
 #define REG_SW_RESET        0x01   /* Software reset (self-clearing) */
 #define REG_SLEEP_CFG       0x02   /* Sleep mode + AREG select */
 #define REG_ASI_CFG0        0x07   /* ASI format + word length */
-#define REG_MICBIAS_CFG     0x3B   /* MICBIAS configuration (P0_R59) */
+#define REG_BIAS_CFG        0x3B   /* BIAS_CFG: MBIAS_VAL[6:4], ADC_FSCALE[1:0] (P0_R59) */
 #define REG_CH1_CFG0        0x3C   /* Channel 1 config 0: input source, impedance (P0_R60) */
+#define REG_CH1_CFG2        0x3E   /* Channel 1 config 2: volume/gain (P0_R62) */
 #define REG_IN_CH_EN        0x73   /* Input channel enable (P0_R115) */
 #define REG_ASI_OUT_CH_EN   0x74   /* ASI output channel enable (P0_R116) */
 #define REG_PWR_CFG         0x75   /* Power-up: ADC, MICBIAS, PLL (P0_R117) */
@@ -55,16 +56,15 @@
    SAI DataSize=SAI_DATASIZE_16 → codec must output 16-bit words to match. */
 #define ASI_CFG0_I2S_16BIT  0x40
 
-/* MICBIAS_CFG (P0_R59): Enable MICBIAS output with 2.75V
-   MICBIAS_VOUT_SEL[2:0] = bits[2:0]: 000=AVDD, 001=VREF, 010-111 = various voltages
-   MICBIAS_SRC_IMP[1:0] = bits[5:4]: source impedance
-   MICBIAS_OUT_EN = bit 7: 1 = enable MICBIAS output
-   For electret mic with 3.3V AVDD: use 2.75V (0b101) → 0x85 */
-#define MICBIAS_CFG_ENABLE_2V75  0x85
+/* BIAS_CFG (P0_R59): MICBIAS voltage and ADC full-scale reference
+   Per TLV320ADC3120 datasheet:
+   - MBIAS_VAL[6:4]: 000=VREF, 001=VREFx1.096, 2-7=reserved
+   - ADC_FSCALE[1:0]: 00=2.75V, 01=2.5V, 10=1.375V
+   Default 0x00 = MICBIAS at VREF (2.75V), ADC ref 2.75V */
+#define BIAS_CFG_DEFAULT  0x00
 
 /* CH1_CFG0 (P0_R60): single-ended input, IN1P signal / IN1M grounded
-   CH1_INSRC[1:0] = bits[6:5] = 01 → single-ended
-   All other bits default (0): 10kΩ impedance, AC-coupled, no DC offset */
+   CH1_INSRC[1:0] = bits[6:5] = 01 → single-ended */
 #define CH1_CFG0_SINGLE_ENDED  0x20
 
 /* Channel enables — mono: channel 1 only */
@@ -81,60 +81,41 @@ static HAL_StatusTypeDef Codec_WriteReg(I2C_HandleTypeDef *hi2c, uint8_t reg, ui
   return HAL_I2C_Master_Transmit(hi2c, ADC3120_ADDR, buf, 2, 100);
 }
 
-/* Read a single register on page 0 */
-static HAL_StatusTypeDef Codec_ReadReg(I2C_HandleTypeDef *hi2c, uint8_t reg, uint8_t *val)
-{
-  HAL_StatusTypeDef st = HAL_I2C_Master_Transmit(hi2c, ADC3120_ADDR, &reg, 1, 100);
-  if (st != HAL_OK) return st;
-  return HAL_I2C_Master_Receive(hi2c, ADC3120_ADDR, val, 1, 100);
-}
-
 /**
-  * @brief  Initialize TLV320ADC3120 for 2-channel analog recording.
-  *         SAI must be configured as I2S master before calling this.
-  *         BCLK and FSYNC will be applied by HAL_SAI_Receive_DMA().
+  * @brief  Initialize TLV320ADC3120 for recording.
+  *         Call AudioCodec_PowerUp() AFTER HAL_SAI_Receive_DMA() starts clocks.
+  * @param  hi2c   I2C handle
+  * @param  gain   Digital gain for CH1_CFG2: 0x00=0dB, each step=0.5dB (0x38=28dB)
   */
-/* Global diagnostic: last read-back value for debug logging */
-uint8_t g_codecReadback = 0xFF;
-HAL_StatusTypeDef g_codecI2cStatus = HAL_OK;
-
-unsigned char AudioCodec_Initialize(I2C_HandleTypeDef *hi2c)
+unsigned char AudioCodec_Initialize(I2C_HandleTypeDef *hi2c, uint8_t gain)
 {
   /* 1. Software reset — restores all registers to POR defaults */
-  g_codecI2cStatus = Codec_WriteReg(hi2c, REG_SW_RESET, 0x01);
+  Codec_WriteReg(hi2c, REG_SW_RESET, 0x01);
   HAL_Delay(2);
 
   /* 2. Wake from sleep, enable internal AREG regulator (required for AVDD=3.3V) */
   Codec_WriteReg(hi2c, REG_SLEEP_CFG, SLEEP_CFG_ACTIVE_INTERNAL_AREG);
   HAL_Delay(2);  /* >= 1 ms required after wake-up */
 
-  /* 3. Set ASI format to I2S, 16-bit word length.
-     Default (0x30) is TDM mode — must change to I2S to match SAI config.
-     16-bit word matches SAI DataSize=SAI_DATASIZE_16. */
+  /* 3. Set ASI format to I2S, 16-bit word length */
   Codec_WriteReg(hi2c, REG_ASI_CFG0, ASI_CFG0_I2S_16BIT);
 
-  /* 3b. Configure channel 1 as single-ended input (IN1P signal, IN1M grounded).
-     Default is differential — wrong for this schematic. */
+  /* 4. Configure channel 1 as single-ended input (IN1P/IN1M) */
   Codec_WriteReg(hi2c, REG_CH1_CFG0, CH1_CFG0_SINGLE_ENDED);
 
-  /* 3c. Enable MICBIAS output at 2.75V for electret microphone.
-     Without this, the microphone has no bias voltage and outputs no signal. */
-  Codec_WriteReg(hi2c, REG_MICBIAS_CFG, MICBIAS_CFG_ENABLE_2V75);
+  /* 5. Set MICBIAS and ADC full-scale reference to defaults (2.75V) */
+  Codec_WriteReg(hi2c, REG_BIAS_CFG, BIAS_CFG_DEFAULT);
 
-  /* 4. Enable input channel 1 only */
+  /* 6. Set digital gain: 0x00=0dB, 0.5dB/step → 0x38=28dB, 0x28=20dB */
+  Codec_WriteReg(hi2c, REG_CH1_CFG2, gain);
+
+  /* 7. Enable input channel 1 only */
   Codec_WriteReg(hi2c, REG_IN_CH_EN, IN_CH_EN_CH1_ONLY);
 
-  /* Read back MICBIAS_CFG to verify I2C is working */
-  Codec_ReadReg(hi2c, REG_MICBIAS_CFG, &g_codecReadback);
-
-  /* 5. Enable ASI output slot for channel 1 only */
+  /* 8. Enable ASI output slot for channel 1 only */
   Codec_WriteReg(hi2c, REG_ASI_OUT_CH_EN, ASI_OUT_CH1_ONLY);
 
-  /* NOTE: PWR_CFG (step 6) is NOT written here.
-     The codec PLL needs BCLK/FSYNC present when it powers up, otherwise it
-     cannot lock and will not output data. Call AudioCodec_PowerUp() AFTER
-     HAL_SAI_Receive_DMA() has started the SAI clocks. */
-
+  /* NOTE: PWR_CFG is NOT written here — call AudioCodec_PowerUp() after SAI DMA starts */
   return 0;
 }
 

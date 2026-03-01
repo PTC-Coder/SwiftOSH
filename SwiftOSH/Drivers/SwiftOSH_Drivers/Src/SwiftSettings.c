@@ -49,6 +49,9 @@ uint8_t SwiftSettings_GetWAVFileAttributes(WAVFile_Attributes *wav)
   wav->SampleRate = *(__IO uint8_t *)((uint32_t)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 2)) * 1000;
   if (wav->SampleRate == 0 || wav->SampleRate > 96000)
     wav->SampleRate = 32000;  /* Default if unprogrammed */
+  
+  /* DEBUG: Force 32kHz until flash settings are corrected */
+  wav->SampleRate = 32000;
 
   return 1;
 }
