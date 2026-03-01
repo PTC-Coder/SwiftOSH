@@ -235,9 +235,10 @@ uint8_t AudioFiles_WriteHeader(SWIFT_ERRORS *SwiftError, FIL *MyFile)
 
   SwiftError->CallingFunction = FUNC_AudioFiles_WriteHeader;
 
-  /* DEBUG: Force 32kHz until flash settings are fixed for TLV320ADC3120.
-     Original code read from WAVFILE_ATTRIBUTES_OFFSET + 2 which has old codec value. */
-  SampleRateWord = 32000;
+  /* Sample rate from flash (CODEC_SETTINGS_OFFSET+2 = kHz value, same as SwiftSettings reads) */
+  SampleRateWord = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 2) * 1000U;
+  if (SampleRateWord == 0 || SampleRateWord > 96000)
+    SampleRateWord = 32000;
 
   /* File size fields */
   WAVFileHeader[4]  = (BYTE)((MyFile->obj.objsize - 8) & 0xFF);

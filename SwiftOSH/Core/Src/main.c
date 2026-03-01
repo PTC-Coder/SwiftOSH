@@ -921,7 +921,7 @@ void InitializeFATTask(void const *argument)
 
   /* Init codec over I2C — probe only, puts codec to sleep after */
   MX_I2C1_Init();
-  AudioCodec_Initialize(&hi2c1, 0x00);  /* gain=0 for probe, not recording */
+  AudioCodec_Initialize(&hi2c1, 0x00, 0x00);  /* gain=0, bias=off for probe */
   AudioCodec_SleepMode(&hi2c1);
   __HAL_RCC_I2C1_CLK_DISABLE();
 
@@ -1399,15 +1399,21 @@ static void InitializeCodecAndDMA(void)
      powers up. Writing PWR_CFG before SAI clocks start causes PLL lock failure. */
   __HAL_RCC_I2C1_CLK_ENABLE();
   MX_I2C1_Init();
-  /* Gain from flash: CODEC_SETTINGS_OFFSET+3, 0.5dB/step (0x38 = 28dB) */
-  uint8_t codecGain = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 3);
-  if (codecGain == 0xFF) codecGain = 0x38;  /* default 28dB if unprogrammed */
-  HAL_StatusTypeDef codecRet = (HAL_StatusTypeDef)AudioCodec_Initialize(&hi2c1, codecGain);
+  /* Gain from flash: CODEC_SETTINGS_OFFSET+3, 0.5dB/step, 0–95 (ADC3120 max 84=42dB) */
+  uint8_t codecGain    = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 3);
+  if (codecGain == 0xFF) codecGain = 66;  /* default 33dB if unprogrammed */
+
+  /* Mic bias from flash: CODEC_SETTINGS_OFFSET+13 (0x00=off, 0x10=2.5V, 0x18=3.3V) */
+  uint8_t codecMicBias = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 13);
+  if (codecMicBias == 0xFF) codecMicBias = 0x10;  /* default 2.5V if unprogrammed */
+
+  HAL_StatusTypeDef codecRet = (HAL_StatusTypeDef)AudioCodec_Initialize(&hi2c1, codecGain, codecMicBias);
 
   /* Log codec init result — remove once confirmed working */
   {
-    char dbg[60];
-    snprintf(dbg, sizeof(dbg), "<CODEC> init=%d gain=0x%02X\r\n", (int)codecRet, codecGain);
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "<CODEC> init=%d gain=%u bias=0x%02X\r\n",
+             (int)codecRet, codecGain, codecMicBias);
     WriteFlashNextEntry(dbg);
   }
 
@@ -1443,7 +1449,7 @@ static void InitializeCodecAndDMA(void)
   /* Step 3: Now that BCLK/FSYNC are running, power up the codec PLL + ADC.
      Give the SAI a moment to start clocking before the codec PLL tries to lock. */
   HAL_Delay(5);
-  AudioCodec_PowerUp(&hi2c1);
+  AudioCodec_PowerUp(&hi2c1, codecMicBias);
   __HAL_RCC_I2C1_CLK_DISABLE();
 
   /* Log DMA init results — remove once confirmed working */
@@ -1769,9 +1775,11 @@ void NewVoiceMemoTask(void const *argument)
     }
 
     __HAL_RCC_I2C1_CLK_ENABLE();
-    uint8_t codecGain = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 3);
-    if (codecGain == 0xFF) codecGain = 0x38;
-    AudioCodec_Initialize(&hi2c1, codecGain);
+    uint8_t codecGain    = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 3);
+    if (codecGain == 0xFF) codecGain = 66;
+    uint8_t codecMicBias = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 13);
+    if (codecMicBias == 0xFF) codecMicBias = 0x10;
+    AudioCodec_Initialize(&hi2c1, codecGain, codecMicBias);
 
     RTC_AddTimeAndSetAlarmA();
 
@@ -1784,7 +1792,7 @@ void NewVoiceMemoTask(void const *argument)
     SAI1_Block_A->CR1 |= SAI_xCR1_DMAEN;
     __HAL_SAI_ENABLE(&hsai_BlockA1);
     HAL_Delay(5);
-    AudioCodec_PowerUp(&hi2c1);
+    AudioCodec_PowerUp(&hi2c1, codecMicBias);
     __HAL_RCC_I2C1_CLK_DISABLE();
 
     while (LoopFlag)
