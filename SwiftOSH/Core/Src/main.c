@@ -71,6 +71,9 @@ static uint8_t I2SRxBuffer[BUFFER_SIZE] __attribute__((section(".bss")));
 volatile uint8_t g_initComplete = 0;
 volatile uint8_t g_stop2Allowed = 1;
 
+/* ---- Battery voltage cache (updated in USB main loop, read by GET_REPORT handler) ---- */
+volatile float g_CachedBatteryVoltage = -1.0f;
+
 /* ---- Settings / state variables ---- */
 WAVFile_Attributes WAVFile;
 Swift_Schedule     SwiftSchedule;
@@ -114,6 +117,7 @@ static void AudioTransferComplete(SAI_HandleTypeDef *hsai);
 static void AudioTransferHalfComplete(SAI_HandleTypeDef *hsai);
 
 float GetBatteryVoltage(void);
+void  USB_HID_ProcessFlash(void);
 
 /* ================================================================== */
 /*                     CLOCK CONFIGURATION                            */
@@ -1641,7 +1645,22 @@ int main(void)
     osKernelStart();
   }
 
-  while (1) {}
+  /* USB mode main loop — process deferred flash writes and refresh battery cache */
+  while (1)
+  {
+    USB_HID_ProcessFlash();
+
+    /* Refresh battery voltage cache every ~10 seconds.
+       GetBatteryVoltage() uses HAL_Delay + blocking ADC — must NOT be called
+       from USB interrupt context. Update here; GET_REPORT reads g_CachedBatteryVoltage. */
+    static uint32_t lastBattTick = 0;
+    uint32_t now = HAL_GetTick();
+    if (g_CachedBatteryVoltage < 0.0f || (now - lastBattTick) >= 10000)
+    {
+      g_CachedBatteryVoltage = GetBatteryVoltage();
+      lastBattTick = now;
+    }
+  }
 }
 
 #ifdef USE_FULL_ASSERT

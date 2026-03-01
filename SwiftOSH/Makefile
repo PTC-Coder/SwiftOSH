@@ -89,7 +89,8 @@ C_SOURCES = \
   Middlewares/Third_Party/FatFs/src/ff_gen_drv.c \
   Middlewares/Third_Party/FatFs/src/option/syscall.c \
   Middlewares/Third_Party/FatFs/src/option/unicode.c \
-  Core/Src/syscalls.c
+  Core/Src/syscalls.c \
+  Core/Src/swift_defaults.c
 
 # HAL sources (add only what's needed)
 C_SOURCES += \

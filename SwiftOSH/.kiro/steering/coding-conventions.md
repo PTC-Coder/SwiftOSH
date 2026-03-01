@@ -23,6 +23,7 @@
 - Settings page (page 63): 0x0807E000 – 0x0807FFFF
   - Offsets defined in GeneralDefines.h (CODEC_SETTINGS_OFFSET, WAVFILE_ATTRIBUTES_OFFSET, etc.)
 - Flash programming uses QUADWORD (128-bit / 16-byte) writes on STM32U5
+- **CRITICAL: `FLASH_TYPEPROGRAM_QUADWORD` requires 16-byte aligned addresses.** Writes to non-aligned addresses fail silently (HAL returns error, no data written, no fault). All flash offset constants in `GeneralDefines.h` are padded to multiples of 16. Do NOT add new offsets that are not 16-byte aligned.
 
 ## STM32L4 → STM32U5 Porting Notes
 
@@ -36,7 +37,7 @@ When porting code from the original SwiftOne (STM32L4R9):
 - SAI register callbacks: `HAL_SAI_RegisterCallback()` requires `#define USE_HAL_SAI_REGISTER_CALLBACKS 1U` in `stm32u5xx_hal_conf.h`
 - USB: STM32U545 has USB DRD (Device/Host), not OTG. Use `USB_DRD_FS` instance and `PCD_HandleTypeDef`
 - USB clock macros: Use `__HAL_RCC_USB_FS_CLK_ENABLE()` / `__HAL_RCC_USB_FS_CLK_DISABLE()` (not `__HAL_RCC_USB_CLK_ENABLE` which is for USB_OTG_FS)
-- USB Device Library v2.11.3: `USBD_CUSTOM_HID_ItfTypeDef.OutEvent` signature changed from `int8_t (*)(uint8_t *buffer)` to `int8_t (*)(uint8_t event_idx, uint8_t state)`. Access the full report buffer via `((USBD_CUSTOM_HID_HandleTypeDef *)hUsbDeviceFS.pClassData)->Report_buf`
+- USB Device Library v2.11.3: The v2.11.3 template changed `OutEvent` to `int8_t (*)(uint8_t event_idx, uint8_t state)`, but SwiftOSH uses the SwiftOne-style signature `int8_t (*)(uint8_t *buffer)` where Buffer[0] is the report ID. Do NOT use the template signature — the full report buffer is needed to dispatch by report ID. Access the buffer directly from the `OutEvent` parameter, not via `hUsbDeviceFS.pClassData`
 - RCC peripheral clocks (HAL V1.7.0 naming):
   - `RCC_PERIPHCLK_SDMMC` (not `RCC_PERIPHCLK_SDMMC1`)
   - `RCC_PERIPHCLK_ADCDAC` (not `RCC_PERIPHCLK_ADC`)
@@ -72,8 +73,7 @@ External dependencies are NOT in the repo. Before building:
 1. Run `setup_links.bat` (admin prompt) — creates directory junctions for HAL/CMSIS from STM32Cube_FW_U5_V1.7.0
 2. Run `setup_middleware.bat` — clones FreeRTOS V10.3.1 kernel and USB Device Library v2.11.3 from GitHub
 3. Copy CMSIS-RTOS v1 wrapper into `Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS/`:
-   - Both `cmsis_os.c` and `cmsis_os.h` from `SwiftOne_FW/Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS/`
-   - The ST-modified `cmsis_os.h` includes FreeRTOS headers (`FreeRTOS.h`, `task.h`, `queue.h`, `semphr.h`, `event_groups.h`, `timers.h`). Do NOT use the bare ARM template from `Drivers/CMSIS/RTOS/Template/` — it lacks these includes
+   - Both `cmsis_os.c` and `cmsis_os.h` — use the ST-modified version that includes FreeRTOS headers (`FreeRTOS.h`, `task.h`, `queue.h`, `semphr.h`, `event_groups.h`, `timers.h`). Do NOT use the bare ARM template from `Drivers/CMSIS/RTOS/Template/` — it lacks these includes
 
 NOTE: STM32Cube_FW_U5_V1.7.0 does NOT include FreeRTOS or the classic USB Device Library (ST replaced them with ThreadX/USBX for U5).
 
@@ -150,8 +150,8 @@ Fix: Added `.data` copy loop, `.bss` zero loop, and `bl SystemInit` to `Reset_Ha
 
 ### LED polarities (confirmed on hardware)
 - RED (PC1): Active-high — `GPIOC->BSRR = (1UL << 1)` = ON, `GPIOC->BSRR = (1UL << 17)` = OFF
-- GREEN (PA1): Active-low — `GPIOA->BSRR = (1UL << 17)` = ON, `GPIOA->BSRR = (1UL << 1)` = OFF
-- BLUE (PA2): Active-low — `GPIOA->BSRR = (1UL << 18)` = ON, `GPIOA->BSRR = (1UL << 2)` = OFF
+- GREEN (PA1): Active-high — `GPIOA->BSRR = (1UL << 1)` = ON, `GPIOA->BSRR = (1UL << 17)` = OFF
+- BLUE (PA2): Active-high — `GPIOA->BSRR = (1UL << 2)` = ON, `GPIOA->BSRR = (1UL << 18)` = OFF
 
 Note: The ICACHE stale-cache theory was incorrect — ICACHE is disabled by default after reset on STM32U5 (EN = 0 in ICACHE_CR at boot, confirmed in RM0456).
 
@@ -196,3 +196,24 @@ STM32U5 has a completely different peripheral memory map from STM32L4/F4. Do NOT
 ## What Still Needs Porting
 
 - SD firmware update (SD_FW_Update)
+
+## USB Middleware Modifications
+
+The STM32 USB Device Library `usbd_customhid.c` has been modified in two ways:
+
+### GET_REPORT (inline, in Setup handler)
+Inline GET_REPORT handling ported from SwiftOne. Report-ID-specific responses are handled directly in the `USBD_CUSTOM_HID_Setup` function's `CUSTOM_HID_REQ_GET_REPORT` case, responding via `USBD_CtlSendData()`. Includes application-specific headers (`GeneralDefines.h`, `WriteToFlash.h`, `RTC_Swift.h`, `SwiftSettings.h`) and calls `ReadFromFlash()`, `RTC_ReadDateTime()`, `SwiftSettings_GetSTM32VersionInfo()`, `SwiftSettings_GetUniqueID()`. This is intentional — the newer middleware's `GetReport` callback doesn't pass the report ID, making it insufficient.
+
+Battery voltage (report 0x08): returns `g_CachedBatteryVoltage` as millivolts (2 bytes LE). Do NOT call `GetBatteryVoltage()` from this handler — it uses `HAL_Delay` and blocking ADC and will stall the USB interrupt. The cached value is updated every 10 seconds from the USB mode main loop in `main.c`.
+
+### DataOut re-arm (in DataOut handler)
+`DataOut()` calls `USBD_CUSTOM_HID_ReceivePacket(pdev)` after invoking `OutEvent`. Without this, the OUT endpoint is not re-armed and the host cannot send subsequent reports.
+
+### SET_REPORT deferred flash queue (in usbd_custom_hid_if.c)
+`OutEvent_FS` enqueues each incoming OUT report into a 16-entry circular FIFO (`g_FlashQueue[FLASH_QUEUE_DEPTH]`). `USB_HID_ProcessFlash()` is called from the main loop and processes one entry per call. This prevents USB host timeouts caused by flash erase/write latency (~20ms for page erase).
+
+Key protocol rules:
+- Report 2 (codec settings) always arrives first — triggers `EraseFlashSector()` which wipes the entire settings page. All subsequent reports write to already-erased flash
+- Report 4 (RTC set) and report 9 (bootloader jump) are handled immediately in `OutEvent_FS`, not queued
+- Do NOT assume the host sends the full declared report size — buffer may be shorter than the HID descriptor declares. Buffer[0] is always the report ID and IS written to flash; `SwiftSettings` readers skip it with `+2` or `+3` byte offsets
+- **CRITICAL — EP0 SET_REPORT payload includes the report ID byte.** The host sends `[reportID][arraySize][data...]` as the full EP0 data payload. Do NOT prepend the report ID from `req->wValue` — that causes every byte to be shifted by one, silently corrupting all written settings. In `usbd_customhid.c` SET_REPORT handler: call `USBD_CtlPrepareRx(pdev, hhid->Report_buf, req->wLength)` directly — do NOT stash `req->wValue` into `Report_buf[0]` and receive into `&Report_buf[1]`. The symptom of double-prepending is that flash reads back with the first two bytes identical (e.g., `02 02 18 18` instead of `02 18 20 38`).

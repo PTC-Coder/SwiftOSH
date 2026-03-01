@@ -20,7 +20,7 @@ Three external dependencies are NOT in the repo and must be set up before buildi
   - `Drivers/CMSIS/` → junction to STM32Cube_FW_U5_V1.7.0
 - **FreeRTOS Kernel** (V10.3.1-kernel-only) — cloned from GitHub via `setup_middleware.bat`
   - `Middlewares/Third_Party/FreeRTOS/Source/` — kernel sources
-  - `Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS/` — CMSIS-RTOS v1 wrapper (both `cmsis_os.c` and `cmsis_os.h` copied from `SwiftOne_FW/Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS/`; the ST-modified `cmsis_os.h` includes FreeRTOS headers — do NOT use the bare ARM template from `Drivers/CMSIS/RTOS/Template/`)
+  - `Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS/` — CMSIS-RTOS v1 wrapper (both `cmsis_os.c` and `cmsis_os.h` must be manually copied; the ST-modified `cmsis_os.h` includes FreeRTOS headers — do NOT use the bare ARM template from `Drivers/CMSIS/RTOS/Template/`)
 - **STM32 USB Device Library** (v2.11.3) — cloned from GitHub via `setup_middleware.bat`
   - `Middlewares/ST/STM32_USB_Device_Library/`
 
@@ -84,7 +84,7 @@ The `.cproject` is configured for STM32CubeIDE v1.17.0+ managed build with:
 ## FreeRTOS
 
 - FreeRTOS V10.3.1 kernel (cloned from GitHub, tag `V10.3.1-kernel-only`)
-- CMSIS-RTOS v1 wrapper (`cmsis_os.c`/`cmsis_os.h`) copied from `SwiftOne_FW/Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS/` — not included in the kernel repo. The ST-modified `cmsis_os.h` includes FreeRTOS headers (`FreeRTOS.h`, `task.h`, `queue.h`, `semphr.h`, `event_groups.h`, `timers.h`); do NOT use the bare ARM template from `Drivers/CMSIS/RTOS/Template/`
+- CMSIS-RTOS v1 wrapper (`cmsis_os.c`/`cmsis_os.h`) must be manually copied into `Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS/` — not included in the kernel repo. Use the ST-modified version that includes FreeRTOS headers (`FreeRTOS.h`, `task.h`, `queue.h`, `semphr.h`, `event_groups.h`, `timers.h`); do NOT use the bare ARM template from `Drivers/CMSIS/RTOS/Template/`
 - Port: `GCC/ARM_CM33_NTZ/non_secure` for Cortex-M33 non-TrustZone
 - Heap: `heap_4.c`
 - Tickless idle enabled (`configUSE_TICKLESS_IDLE=1`) for Stop 2 low-power
@@ -94,7 +94,14 @@ The `.cproject` is configured for STM32CubeIDE v1.17.0+ managed build with:
 - STM32 USB Device Library v2.11.3 (cloned from GitHub)
 - CustomHID class — same 251-byte report descriptor and report IDs as SwiftOne
 - STM32U545 uses USB DRD (Device/Host), not OTG
-- USB Device Library v2.11.3 `OutEvent` callback signature: `int8_t (*)(uint8_t event_idx, uint8_t state)` — access full report buffer via `hUsbDeviceFS.pClassData`
+- `OutEvent` callback signature in SwiftOSH: `int8_t (*)(uint8_t *buffer)` — SwiftOne-style, NOT the v2.11.3 template `(uint8_t event_idx, uint8_t state)`. Buffer[0] is always the report ID
+- `DataOut()` in `usbd_customhid.c` re-arms the OUT endpoint after calling `OutEvent` via `USBD_CUSTOM_HID_ReceivePacket(pdev)` — required so the host can send subsequent reports
+- SET_REPORT (OUT reports) use a deferred flash queue: `OutEvent_FS` enqueues each report into a 16-entry circular FIFO (`g_FlashQueue`), and `USB_HID_ProcessFlash()` is called from the main loop to process one entry per call. This prevents USB host timeouts from flash erase/write latency
+- Flash stores the full OUT report buffer verbatim: `[reportID][arraySize][data...]`. GET_REPORT reads raw flash and returns it unchanged. The host zeros byte[0] on both sides before comparing — so byte[0] is ignored, bytes 1–N must match exactly. `SwiftSettings` readers use `+2` or `+3` offsets to skip reportID and arraySize
+- Report 2 (codec settings) always arrives first and triggers `EraseFlashSector()` which wipes the entire settings page — all other reports must follow after this erase
+- Report 4 (RTC set) and report 9 (bootloader jump) are handled immediately in `OutEvent_FS`, not deferred
+- Do NOT assume the host sends the full declared report size — buffer may be shorter than the HID descriptor declares
+- **CRITICAL — EP0 SET_REPORT payload includes the report ID byte.** The host sends `[reportID][arraySize][data...]` as the complete EP0 data payload. Do NOT prepend the report ID from `req->wValue` — doing so shifts every byte by one and silently corrupts all written settings. In `usbd_customhid.c`: call `USBD_CtlPrepareRx(pdev, hhid->Report_buf, req->wLength)` directly into `Report_buf[0]`. The symptom of double-prepending is flash reading back with the first two bytes identical (e.g., `02 02 18 18` instead of `02 18 20 38`).
 
 ## Key Peripherals and Pin Mapping
 
@@ -107,11 +114,11 @@ The `.cproject` is configured for STM32CubeIDE v1.17.0+ managed build with:
 - I2C1: PB6=SCL, PB7=SDA (codec at 0x4D)
 - SDMMC1: PC8-11=D0-D3, PC12=CLK, PD2=CMD, PC13=card detect
 - USB: PA11=DM, PA12=DP
-- LEDs: RED=PC1 (active-high), GREEN=PA1 (active-low), BLUE=PA2 (active-high)
+- LEDs: RED=PC1 (active-high), GREEN=PA1 (active-high), BLUE=PA2 (active-high)
 
 ## Original Firmware Reference
 
-The original SwiftOne firmware lives in `../SwiftOne_FW/`. When porting additional features, reference the driver implementations in `SwiftOne_FW/Drivers/Swift_Drivers/Src/`.
+The original SwiftOne firmware was used as a reference during porting. The SwiftOSH codebase is now self-contained — no external SwiftOne_FW reference folder is needed.
 
 ## Current State (Bring-Up)
 
@@ -143,9 +150,34 @@ The startup assembly (`Reset_Handler`) was missing the standard `.data` copy (fl
 Fix: Added `.data` copy loop, `.bss` zero loop, and `bl SystemInit` to `Reset_Handler` before `bl main`.
 
 ### LED polarities (confirmed on hardware)
-- RED (PC1): Active-high — BSRR set = ON, BSRR reset = OFF
-- GREEN (PA1): Active-low — BSRR reset = ON, BSRR set = OFF
-- BLUE (PA2): Active-high — BSRR set = ON, BSRR reset = OFF (same as RED, not active-low like GREEN)
+- RED (PC1): Active-high — SET = ON, RESET = OFF
+- GREEN (PA1): Active-high — SET = ON, RESET = OFF
+- BLUE (PA2): Active-high — SET = ON, RESET = OFF
+- All three LEDs are active-high (original SwiftOne code assumed GREEN/BLUE were active-low — wrong for this board)
+
+### SD card mount reliability (RESOLVED)
+Flash log analysis revealed the SD card mount was failing repeatedly on cold boot and after Stop 2 wake-up, requiring full reboots to eventually succeed. Four issues found and fixed:
+
+1. **No retry logic in InitializeFATTask**: The task called `AudioFiles_MountSDCard()` once and terminated on failure, forcing a full reboot. Fix: Added a 5-attempt retry loop with `HAL_SD_DeInit()` and 500ms delay between attempts.
+2. **SDMMC registers lost in Stop 2**: The SDMMC peripheral registers are in the AHB2 domain which is powered down in Stop 2. `StandbyTask` and `InitializeScheduleTask` re-enabled the SDMMC clock after wake-up but never re-configured the peripheral. Fix: Added `MX_SDMMC1_SD_Init()` calls after every Stop 2 wake-up path (StandbyTask, InitializeScheduleTask case 1 and case 2).
+3. **FatFS driver slot leak on retries**: `AudioFiles_MountSDCard()` called `FATFS_LinkDriver()` without unlinking first, so retries would exhaust the FatFS driver slots. Fix: Added `FATFS_UnLinkDriver(SD_Path)` before `FATFS_LinkDriver()` (note: capital L in `UnLink`).
+4. **BSP_SD_IsDetected() was a stub**: Always returned `SD_PRESENT` without reading the actual detect pin. Fix: Now reads PC13 (SDMMC1.DETECT) — LOW = card present (external pull-up, switch to ground).
+
+### SD card hot-insertion detection (RESOLVED)
+PC13 was configured as `GPIO_MODE_IT_RISING_FALLING` EXTI but no callback handled it. Fix:
+- Added `HAL_GPIO_EXTI_Falling_Callback` for PC13 — sets `SD_INSERTED_SIGNAL` (bit 17 in event group)
+- `ErrorTask` now listens for both `ERROR_SIGNAL` and `SD_INSERTED_SIGNAL` — on card insertion, does 200ms debounce then `NVIC_SystemReset()` for a clean reboot through the full init path with retry logic
+
+### LED blink duty cycle too long (RESOLVED)
+LPTIM2 auto-reload ISR was toggling LEDs, giving 50% duty cycle over a ~3.9s period (~2s ON). Fix: Changed to pulse mode — auto-reload turns LEDs ON, new `HAL_LPTIM_CompareMatchCallback` turns them OFF after ~150ms (38 ticks at 256 Hz). `BLINK_ON_TICKS` define in StatusLED.c controls the ON duration.
+
+### USB HID GET_REPORT not working (RESOLVED)
+The SwiftOne Firmware Updater app showed all zeros (SN: 00000000000, FW: 0.0.0.0). The host app uses `GET_REPORT` control requests (not interrupt IN reports), but the SwiftOSH USB middleware had the handler behind an `#ifdef USBD_CUSTOMHID_CTRL_REQ_GET_REPORT_ENABLED` that wasn't defined. Fix: Added inline GET_REPORT handling directly in `usbd_customhid.c` Setup handler, matching the SwiftOne pattern — responds to each report ID with the appropriate data via `USBD_CtlSendData()`.
+
+### Battery voltage reading 0V (RESOLVED)
+`ADC_EN` (PB15) controls the battery voltage divider but was never driven high before ADC reads. In recording mode, `MX_GPIO_Init()` configured it as output but drove it LOW. In USB mode, `MX_GPIO_Init_USB()` didn't configure it at all. Fix:
+- `GetBatteryVoltage()` now drives `ADC_EN` HIGH with 5ms settling delay before reading, then drives it LOW after to save power
+- `MX_GPIO_Init_USB()` now configures `ADC_EN`, `VBAT_SCALED` (PA0 analog), and enables GPIOB clock
 
 ### What works
 - Raw register LED blink — MCU boots and reaches main() reliably
@@ -154,7 +186,14 @@ Fix: Added `.data` copy loop, `.bss` zero loop, and `bl SystemInit` to `Reset_Ha
 - HAL_Init, SystemClock_Config_USB (HSE + PLL + HSI48 + CRS)
 - MX_RTC_Init
 - USB HID enumerates properly on PC host
+- USB HID GET_REPORT returns serial number, firmware version, battery voltage, and all settings
+- USB HID SET_REPORT (write settings to device) — deferred flash queue implemented and verified working
 - BLUE LED turns on when USB connected
+- SD card mounts reliably with retry logic
+- SD card hot-insertion triggers reboot and re-mount
+- SDMMC re-initializes properly after Stop 2 wake-up
+- LED blink shows quick ~150ms pulse every ~4 seconds
+- Battery voltage reads correctly via ADC with voltage divider enable
 
 ### Key observations
 - The FreeRTOS CM33 port (`ARM_CM33_NTZ/non_secure`) hardcodes `PendSV_Handler`, `SVC_Handler`, `SysTick_Handler` as function names directly in `portasm.c` and `port.c`. The `#define` mappings in `FreeRTOSConfig.h` are redundant for this port but must remain because the port source uses those exact CMSIS names
@@ -185,11 +224,60 @@ Fix: Added `HAL_Delay(5)` in `USBD_LL_Start()` (usbd_conf.c) before writing `USB
 
 Fix: Changed to `GPIO_PIN_SET` in `MX_GPIO_Init_USB()`.
 
+### SD card not mounting in recording mode (INVESTIGATING)
+Four issues found:
+1. **SDMMC GPIO missing pull-ups**: Fix: Added `GPIO_PULLUP` on D0-D3 and CMD, `GPIO_SPEED_FREQ_VERY_HIGH`.
+2. **Bus width set to 4-bit before init**: Fix: Changed to `SDMMC_BUS_WIDE_1B`.
+3. **Clock divider too aggressive**: Fix: Changed `ClockDiv` from 0 to 2 (~20 MHz).
+4. **PLL1-P not enabled**: `HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SDMMC)` returned 0. Diagnostic confirmed `SDMMC_ERROR_INVALID_PARAMETER`. Fix: Added explicit `__HAL_RCC_PLLCLKOUT_ENABLE(RCC_PLL1_DIVP)` in `MX_SDMMC1_SD_Init()`. Also added missing `PLL2ClockOut = RCC_PLL2_DIVP` to `SystemClock_Config()`.
+
+### StatusLED polarity bugs (RESOLVED)
+All LEDs are active-high. Original code assumed GREEN/BLUE were active-low. Fixed all GPIO writes in StatusLED.c, BlinkLEDTask, and LowBatteryTask.
+
+### StatusLED LPTIM2 blink too fast (RESOLVED)
+LPTIM2 kernel clock defaulted to PCLK1 (80 MHz) — blink period was 1.6ms (appeared solid). Fix: Added `RCC_LPTIM2CLKSOURCE_LSE` to `SystemClock_Config()`. Now 256 Hz counter, ~3.9s blink cycle.
+
+### LPModes Stop2 wake-up missing PLL1-P (RESOLVED)
+`LPModes_RestoreClockAfterStop2()` lost PLL1-P after reconfiguring PLL1. Fix: Added `RCC_PERIPHCLK_SDMMC` and `PLL2ClockOut` to the wake-up PeriphClkInit.
+
+### USB SET_REPORT flash alignment bug (RESOLVED)
+All settings writes except codec and WAV file were silently failing. Root cause: `FLASH_TYPEPROGRAM_QUADWORD` on STM32U5 requires 16-byte aligned addresses — any write to a non-aligned address fails silently (returns error, no data written).
+
+The original offsets in `GeneralDefines.h` packed blocks tightly (codec=0, clockdiv=24, wavfile=48, ...). Only offsets 0 and 48 are 16-byte aligned; all others (24, 72, 120, 168, 216) are not. This is why only codec and WAV file appeared in the flash dump after a settings write.
+
+Fix: All offsets in `GeneralDefines.h` padded to 16-byte boundaries:
+- `CODEC_SETTINGS_OFFSET` = 0 (unchanged)
+- `STM32_CLOCKDIV_OFFSET` = 32 (was 24)
+- `WAVFILE_ATTRIBUTES_OFFSET` = 64 (was 48)
+- `SCHEDULE_STARTTIMES_OFFSET` = 96 (was 72)
+- `SCHEDULE_STOPTIMES_OFFSET` = 144 (was 120)
+- `LATLONG_OFFSET` = 192 (was 168)
+- `DST_OFFSET` = 240 (was 216)
+- `CONFIG_TEXTFILE_OFFSET` = 272 (was 248)
+
+`swift_defaults.c` updated to match the new layout (656 bytes total, was 632). `SwiftSettings.c` uses the constants throughout — no hardcoded offsets — so it updated automatically.
+
+### USB SET_REPORT EP0 payload double-prepend bug (RESOLVED)
+All settings were being written with every byte shifted by one position, causing the host read-back verification to fail. Root cause: the `CUSTOM_HID_REQ_SET_REPORT` handler in `usbd_customhid.c` was stashing the report ID from `req->wValue` into `Report_buf[0]` and then receiving the EP0 data payload into `&Report_buf[1]`. But the host already includes the report ID as the first byte of the EP0 payload — so the report ID ended up doubled (e.g., `02 02 18 18` instead of `02 18 20 38`).
+
+Fix: Removed the manual stash. `USBD_CtlPrepareRx` now receives directly into `Report_buf[0]` with the full `req->wLength`. The host payload `[reportID][arraySize][data...]` lands correctly at `Report_buf[0..N]`.
+
+### Battery voltage blocking USB interrupt (RESOLVED)
+`GetBatteryVoltage()` was called directly from the GET_REPORT handler inside the USB interrupt context. It calls `HAL_Delay(5)`, `MX_ADC1_Init()`, ADC calibration, and polling — all blocking. This caused USB sluggishness and broke RTC time reading (USB interrupt starved other operations).
+
+Fix: Added `volatile float g_CachedBatteryVoltage = -1.0f` global in `main.c`. The USB mode main loop calls `GetBatteryVoltage()` every 10 seconds and stores the result. The GET_REPORT handler for report 0x08 now reads `g_CachedBatteryVoltage` instead of calling `GetBatteryVoltage()` directly. `MX_GPIO_Init_USB()` no longer drives `ADC_EN` high at init — `GetBatteryVoltage()` manages the pin itself.
+
 ### What still needs to happen
 1. ~~Fix boot faults~~ DONE
 2. ~~Get HAL_Init() working~~ DONE
 3. ~~Get SystemClock_Config_USB() working (HSE + PLL + HSI48)~~ DONE
 4. ~~Get MX_RTC_Init() working~~ DONE
 5. ~~Get MX_USB_DEVICE_Init() working — USB HID enumeration on PC~~ DONE
-6. Restore full VBUS-detect dual-path main() (USB vs recording mode)
-7. Port SD firmware update (SD_FW_Update) from SwiftOne
+6. ~~Restore full VBUS-detect dual-path main() (USB vs recording mode)~~ DONE
+7. ~~Get SD card mounting in recording mode~~ DONE (retry logic + Stop 2 re-init)
+8. ~~Get USB HID GET_REPORT working (serial number, FW version, battery, settings)~~ DONE
+9. ~~Fix battery voltage ADC reading (ADC_EN not driven)~~ DONE
+10. ~~Fix SD card detect (BSP_SD_IsDetected stub)~~ DONE
+11. ~~Fix LED blink duty cycle (too long ON time)~~ DONE
+12. ~~USB HID SET_REPORT (write settings to device)~~ DONE — deferred flash queue, 16-byte aligned offsets, verified working
+13. Port SD firmware update (SD_FW_Update) from SwiftOne

@@ -41,11 +41,14 @@ uint8_t SwiftSettings_GetWAVFileAttributes(WAVFile_Attributes *wav)
   wav->FileSize = (((t4 << 24) | (t3 << 16) | (t2 << 8) | t1) / 2);
 
   wav->FilenameLength = *(__IO uint8_t *)(addr++);
+  if (wav->FilenameLength > 20) wav->FilenameLength = 5;  /* Sanity: unprogrammed flash = 0xFF */
   for (int i = 0; i < wav->FilenameLength; i++)
     wav->Filename[i] = *(__IO uint8_t *)(addr++);
   wav->Filename[wav->FilenameLength] = 0;
 
-  wav->SampleRate = *(__IO uint8_t *)((uint32_t)(SETTINGS_BASE_ADDRESS + WAVFILE_ATTRIBUTES_OFFSET)) * 1000;
+  wav->SampleRate = *(__IO uint8_t *)((uint32_t)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 2)) * 1000;
+  if (wav->SampleRate == 0 || wav->SampleRate > 96000)
+    wav->SampleRate = 32000;  /* Default if unprogrammed */
 
   return 1;
 }
@@ -72,6 +75,7 @@ uint8_t SwiftSettings_GetSwiftSchedule(Swift_Schedule *sched)
   sched->StopDate.Date  = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + SCHEDULE_STOPTIMES_OFFSET + 4);
 
   sched->NumberOfRecords = *(__IO uint8_t *)(startAddr++);
+  if (sched->NumberOfRecords > 20) sched->NumberOfRecords = 0;  /* Sanity: unprogrammed flash = 0xFF */
 
   if (sched->ScheduleType == SCHEDULE_TYPE_ARBITRARY ||
       sched->ScheduleType == SCHEDULE_TYPE_CONTINUOUS)

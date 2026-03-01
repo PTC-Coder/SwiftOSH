@@ -27,10 +27,25 @@ static uint8_t IsProtectedAddress(uint32_t Address)
     return (page_start >= FLASH_SETTINGS_PAGE_START) ? 1 : 0;
 }
 
-/* Get page number for a given address (single-bank, 8KB pages) */
+/* STM32U545: Dual-bank flash, 256KB per bank, 32 pages per bank
+   Bank selection depends on SWAP_BANK option byte:
+   - SWAP_BANK=0: Lower=Bank1, Upper=Bank2
+   - SWAP_BANK=1: Lower=Bank2, Upper=Bank1 */
+static uint32_t GetBank(uint32_t Address)
+{
+    uint8_t swapped = (FLASH->OPTR & FLASH_OPTR_SWAP_BANK) ? 1 : 0;
+    if (Address < 0x08040000)
+        return swapped ? FLASH_BANK_2 : FLASH_BANK_1;
+    else
+        return swapped ? FLASH_BANK_1 : FLASH_BANK_2;
+}
+
 static uint32_t GetPage(uint32_t Address)
 {
-    return (Address - 0x08000000) / FLASH_PAGE_SIZE_BYTES;
+    if (Address < 0x08040000)
+        return (Address - 0x08000000) / FLASH_PAGE_SIZE_BYTES;
+    else
+        return (Address - 0x08040000) / FLASH_PAGE_SIZE_BYTES;
 }
 
 FlashStatus_t Flash_EraseSinglePage(uint32_t PageAddress)
@@ -45,7 +60,7 @@ FlashStatus_t Flash_EraseSinglePage(uint32_t PageAddress)
     HAL_FLASH_Unlock();
 
     EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-    EraseInitStruct.Banks     = FLASH_BANK_1;
+    EraseInitStruct.Banks     = GetBank(PageAddress);
     EraseInitStruct.Page      = GetPage(PageAddress);
     EraseInitStruct.NbPages   = 1;
 
@@ -75,7 +90,7 @@ FlashStatus_t Flash_ErasePage(uint32_t StartAddr, uint32_t EndAddr)
     uint32_t end_page   = GetPage(EndAddr);
 
     EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-    EraseInitStruct.Banks     = FLASH_BANK_1;
+    EraseInitStruct.Banks     = GetBank(StartAddr);
     EraseInitStruct.Page      = start_page;
     EraseInitStruct.NbPages   = end_page - start_page + 1;
 

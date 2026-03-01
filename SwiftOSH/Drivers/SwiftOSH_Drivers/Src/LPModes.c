@@ -92,9 +92,10 @@ void LPModes_RestoreClockAfterStop2(void)
         return;
     }
 
-    /* Re-enable PLL2 for SAI1 audio clock */
-    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
+    /* Re-enable PLL2 for SAI1 audio clock, and PLL1-P for SDMMC */
+    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_SAI1 | RCC_PERIPHCLK_SDMMC;
     PeriphClkInit.Sai1ClockSelection   = RCC_SAI1CLKSOURCE_PLL2;
+    PeriphClkInit.SdmmcClockSelection  = RCC_SDMMCCLKSOURCE_PLL1;
     PeriphClkInit.PLL2.PLL2Source = RCC_PLLSOURCE_HSE;
     PeriphClkInit.PLL2.PLL2M = 3;
     PeriphClkInit.PLL2.PLL2N = 64;
@@ -103,6 +104,7 @@ void LPModes_RestoreClockAfterStop2(void)
     PeriphClkInit.PLL2.PLL2R = 8;
     PeriphClkInit.PLL2.PLL2RGE   = RCC_PLLVCIRANGE_1;
     PeriphClkInit.PLL2.PLL2FRACN = 0;
+    PeriphClkInit.PLL2.PLL2ClockOut = RCC_PLL2_DIVP;
     HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit);
 
     HAL_ResumeTick();

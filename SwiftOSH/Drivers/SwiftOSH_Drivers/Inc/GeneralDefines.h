@@ -11,17 +11,19 @@
 #define ERROR      2
 
 /* Flash settings storage — STM32U545 has 512KB flash, single bank, 8KB pages.
-   Use last 8KB page (page 63) at 0x0807E000 for settings. */
+   Use last 8KB page (page 63) at 0x0807E000 for settings.
+   CRITICAL: STM32U5 FLASH_TYPEPROGRAM_QUADWORD requires 16-byte aligned addresses.
+   All offsets MUST be multiples of 16 (0x10). */
 #define SETTINGS_BASE_ADDRESS     ((uint32_t)0x0807E000)
 
-#define CODEC_SETTINGS_OFFSET       ((uint32_t)0)
-#define STM32_CLOCKDIV_OFFSET       ((uint32_t)24)
-#define WAVFILE_ATTRIBUTES_OFFSET   ((uint32_t)48)
-#define SCHEDULE_STARTTIMES_OFFSET  ((uint32_t)72)
-#define SCHEDULE_STOPTIMES_OFFSET   ((uint32_t)120)
-#define LATLONG_OFFSET              ((uint32_t)168)
-#define DST_OFFSET                  ((uint32_t)216)
-#define CONFIG_TEXTFILE_OFFSET      ((uint32_t)248)
+#define CODEC_SETTINGS_OFFSET       ((uint32_t)0)    /* 24 bytes → pad to 32 → next at 32 */
+#define STM32_CLOCKDIV_OFFSET       ((uint32_t)32)   /* 24 bytes → pad to 32 → next at 64 */
+#define WAVFILE_ATTRIBUTES_OFFSET   ((uint32_t)64)   /* 24 bytes → pad to 32 → next at 96 */
+#define SCHEDULE_STARTTIMES_OFFSET  ((uint32_t)96)   /* 48 bytes → next at 144 */
+#define SCHEDULE_STOPTIMES_OFFSET   ((uint32_t)144)  /* 48 bytes → next at 192 */
+#define LATLONG_OFFSET              ((uint32_t)192)  /* 48 bytes → next at 240 */
+#define DST_OFFSET                  ((uint32_t)240)  /* 32 bytes → next at 272 */
+#define CONFIG_TEXTFILE_OFFSET      ((uint32_t)272)  /* variable, each packet 48 bytes */
 
 #define SCHEDULE_TYPE_ARBITRARY     ((uint8_t)0x01)
 #define SCHEDULE_TYPE_DUTYCYCLED    ((uint8_t)0x02)

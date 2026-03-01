@@ -19,8 +19,9 @@ _Min_Stack_Size = 0x2000;
 
 MEMORY
 {
-  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
-  RAM   (rw)  : ORIGIN = 0x20000000, LENGTH = 256K   /* SRAM1 + SRAM2 contiguous */
+  FLASH    (rx)  : ORIGIN = 0x08000000, LENGTH = 504K   /* Code + rodata: pages 0-62 */
+  SETTINGS (rx)  : ORIGIN = 0x0807E000, LENGTH = 8K     /* Page 63: Swift config defaults */
+  RAM      (rw)  : ORIGIN = 0x20000000, LENGTH = 256K   /* SRAM1 + SRAM2 contiguous */
 }
 
 SECTIONS
@@ -125,6 +126,15 @@ SECTIONS
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
   } >RAM
+
+  /* Swift configuration defaults — placed at page 63 (0x0807E000).
+     Linker will NOT erase/overwrite this page unless the section has content.
+     The config utility and SwiftSettings.c read from these fixed addresses. */
+  .swift_settings 0x0807E000 :
+  {
+    KEEP(*(.swift_settings))
+    KEEP(*(.swift_settings.*))
+  } >SETTINGS
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }

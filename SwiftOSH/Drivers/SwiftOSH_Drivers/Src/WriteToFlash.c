@@ -10,29 +10,62 @@
 #include "stm32u5xx_hal.h"
 #include "WriteToFlash.h"
 #include "GeneralDefines.h"
+#include <string.h>
+
+/* Global debug variables to check flash status */
+volatile uint32_t g_LastFlashError = 0;
+volatile HAL_StatusTypeDef g_LastEraseStatus = HAL_OK;
+volatile HAL_StatusTypeDef g_LastWriteStatus = HAL_OK;
+
+/* Check if SWAP_BANK option is enabled at runtime */
+static uint32_t GetSettingsBank(void)
+{
+  /* FLASH_OPTR_SWAP_BANK is bit 20 in FLASH->OPTR */
+  if (FLASH->OPTR & FLASH_OPTR_SWAP_BANK)
+    return FLASH_BANK_1;  /* Banks swapped: upper half is Bank 1 */
+  else
+    return FLASH_BANK_2;  /* Normal: upper half is Bank 2 */
+}
 
 /**
   * @brief  Write data to flash at SETTINGS_BASE_ADDRESS + offset.
   *         Data is written in 128-bit (16-byte / quadword) chunks on STM32U5.
-  * @param  buffer  Pointer to source data (must be 16-byte aligned content)
+  *         NOTE: size parameter is number of DOUBLEWORDS (8-byte units) for
+  *         compatibility with SwiftOne. We convert to quadwords internally.
+  * @param  buffer  Pointer to source data
   * @param  offset  Byte offset from SETTINGS_BASE_ADDRESS
-  * @param  size    Number of quadwords (16-byte units) to write
+  * @param  size    Number of doublewords (8-byte units) - for SwiftOne compatibility
   * @retval 1 on success
   */
 uint8_t WriteToFlash(uint8_t *buffer, uint32_t offset, uint16_t size)
 {
   uint32_t Address = offset + SETTINGS_BASE_ADDRESS;
-  uint32_t *dataPointer = (uint32_t *)buffer;
-
+  
+  /* Convert doubleword count to byte count */
+  uint32_t byteCount = size * 8;
+  
+  /* 16-byte aligned buffer required for STM32U5 quadword flash writes */
+  uint32_t quadword[4] __attribute__((aligned(16)));
+  
   HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+  
+  /* Wait for any previous operation to complete */
+  while (__HAL_FLASH_GET_FLAG(FLASH_FLAG_BSY)) {}
 
-  for (int i = 0; i < size; i++)
+  for (uint32_t i = 0; i < byteCount; i += 16)
   {
-    /* STM32U5 programs in quadwords (128 bits = 16 bytes = 4 x uint32_t) */
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, Address + (16 * i),
-                       (uint32_t)&dataPointer[4 * i]);
-    /* Note: STM32U5 HAL_FLASH_Program takes the address of the data for
-       QUADWORD programming, not the data value itself. */
+    memset(quadword, 0xFF, 16);
+    uint32_t chunk = (byteCount - i >= 16) ? 16 : (byteCount - i);
+    memcpy((uint8_t*)quadword, &buffer[i], chunk);
+    
+    g_LastWriteStatus = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, Address + i, (uint32_t)quadword);
+    if (g_LastWriteStatus != HAL_OK)
+    {
+      g_LastFlashError = HAL_FLASH_GetError();
+      HAL_FLASH_Lock();
+      return 0;
+    }
   }
 
   HAL_FLASH_Lock();
@@ -67,6 +100,7 @@ uint8_t EraseFlashSector(void)
 {
   FLASH_EraseInitTypeDef EraseInitStruct;
   uint32_t PAGEError = 0;
+  HAL_StatusTypeDef status;
 
   HAL_FLASH_Unlock();
 
@@ -74,12 +108,21 @@ uint8_t EraseFlashSector(void)
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
   EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-  EraseInitStruct.Banks     = FLASH_BANK_1;
-  EraseInitStruct.Page      = 63;   /* 0x0807E000 / 0x2000 = page 63 */
+  /* STM32U545: 512KB dual-bank flash, 256KB per bank, 32 pages per bank
+     0x0807E000 is page 31 in upper half - bank depends on SWAP_BANK option */
+  EraseInitStruct.Banks     = GetSettingsBank();
+  EraseInitStruct.Page      = 31;   /* (0x0807E000 - 0x08040000) / 0x2000 = page 31 */
   EraseInitStruct.NbPages   = 1;
 
-  HAL_FLASHEx_Erase(&EraseInitStruct, &PAGEError);
+  status = HAL_FLASHEx_Erase(&EraseInitStruct, &PAGEError);
+  g_LastEraseStatus = status;
+  g_LastFlashError = HAL_FLASH_GetError();
 
   HAL_FLASH_Lock();
+  
+  if (status != HAL_OK || PAGEError != 0xFFFFFFFF)
+  {
+    return 0;
+  }
   return 1;
 }

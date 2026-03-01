@@ -14,10 +14,12 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 ## Implemented Drivers
 
 ### WriteToFlash (WriteToFlash.h / WriteToFlash.c)
-- `WriteToFlash(buffer, offset, size)` — writes `size` quadwords (16-byte units) to flash at SETTINGS_BASE_ADDRESS + offset
+- `WriteToFlash(buffer, offset, size)` — writes data to flash at SETTINGS_BASE_ADDRESS + offset. `size` is in **doublewords (8-byte units)** for SwiftOne compatibility — `size=3` = 24 bytes written, `size=6` = 48 bytes written. Internally converts to quadword (16-byte) writes as required by STM32U5 HAL
 - `ReadFromFlash(buffer, offset, size)` — reads `size` bytes from flash
-- `EraseFlashSector()` — erases settings page 63 (0x0807E000)
-- Flash programming on STM32U5 uses QUADWORD (128-bit) writes. The HAL_FLASH_Program data parameter is a pointer to the source data
+- `EraseFlashSector()` — erases settings page 63 (0x0807E000, page 31 in Bank 2)
+- Flash programming on STM32U5 uses QUADWORD (128-bit / 16-byte) writes. The HAL_FLASH_Program data parameter is a pointer to the source data, not the data value
+- **CRITICAL: `FLASH_TYPEPROGRAM_QUADWORD` requires 16-byte aligned addresses.** Writes to non-aligned addresses fail silently. All `offset` values passed to `WriteToFlash` must be multiples of 16. The constants in `GeneralDefines.h` are all 16-byte aligned — do not add new offsets that are not
+- `g_LastWriteStatus`, `g_LastEraseStatus`, `g_LastFlashError` — debug globals for checking flash operation results
 
 ### AudioCodec (AudioCodec.h / AudioCodec.c)
 - `AudioCodec_Initialize(hi2c)` — configures TLV320ADC3120 via I2C using settings from flash
@@ -55,7 +57,7 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - Uses `FRESULT` from ff.h for FatFS error codes
 
 ### AudioFiles (AudioFiles.h / AudioFiles.c)
-- `AudioFiles_MountSDCard(SwiftError)` — links SD driver, mounts FatFS volume
+- `AudioFiles_MountSDCard(SwiftError)` — links SD driver, mounts FatFS volume. Calls `FATFS_UnLinkDriver()` before `FATFS_LinkDriver()` to handle retries safely (note: capital L in `UnLinkDriver`)
 - `AudioFiles_NewRecordingDirectory(WAVFile)` — creates numbered recording directory (e.g., PREFIX000)
 - `AudioFiles_NewDayDirectory(label)` — creates date-stamped subdirectory (e.g., PREFIX2026-02-11)
 - `AudioFiles_NewAudioFile(label, suffix, file)` — creates timestamped WAV file, seeks past 46-byte header
@@ -68,6 +70,22 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - Flash offset constants for all settings blocks
 - Schedule type enums (ARBITRARY, DUTYCYCLED, CONTINUOUS)
 - Codec I2C address define
+
+### USB HID Flash Queue (usbd_custom_hid_if.c)
+- `USB_HID_ProcessFlash()` — deferred flash write processor, called from the main loop in USB mode. Processes one queued report per call
+- `OutEvent_FS` enqueues all flash-writing reports into `g_FlashQueue[FLASH_QUEUE_DEPTH]` (16-entry circular FIFO) and returns immediately — prevents USB host timeouts from flash erase/write latency
+- Report 2 (codec settings) triggers `EraseFlashSector()` then writes at `CODEC_SETTINGS_OFFSET`. The host always sends report 2 first before any other settings report
+- Reports 4 (RTC set) and 9 (bootloader jump) are handled immediately in `OutEvent_FS`, not queued
+- Flash write offsets per report ID (all 16-byte aligned — QUADWORD requirement):
+  - Report 2: `CODEC_SETTINGS_OFFSET` (0), size=3 (24 bytes)
+  - Report 12: `STM32_CLOCKDIV_OFFSET` (32), size=3
+  - Report 14: `WAVFILE_ATTRIBUTES_OFFSET` (64), size=3
+  - Report 16: `SCHEDULE_STARTTIMES_OFFSET` (96), size=6 (48 bytes)
+  - Report 18: `SCHEDULE_STOPTIMES_OFFSET` (144), size=6
+  - Report 19: `CONFIG_TEXTFILE_OFFSET` (272) + (data[1] * 48), size=6
+  - Report 22: `LATLONG_OFFSET` (192), size=6
+  - Report 24: `DST_OFFSET` (240), size=4 (also calls `RTC_SetDSTActiveFlag`)
+- Battery voltage for GET_REPORT (report 0x08): use `g_CachedBatteryVoltage` (declared `volatile float` in `main.c`). The USB main loop refreshes it every 10 seconds via `GetBatteryVoltage()`. Never call `GetBatteryVoltage()` from interrupt context — it uses `HAL_Delay` and blocking ADC
 
 ### FlashLogging (FlashLogging.h / FlashLogging.c)
 - `Flash_Init()` — clears flash error flags
@@ -88,8 +106,9 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - `StatusLED_SolidBlueLED()` / `SolidGreenLED()` / `SolidAllLED()` — solid LED states
 - `StatusLED_AllOutputs()` — stops LPTIM2, turns all LEDs off
 - `StatusLED_LowBatteryMode()` — stops LPTIM2 for manual LED control in low-battery task
-- Uses LPTIM2 auto-reload interrupt to toggle GPIO (no AF routing on U545 LED pins)
+- Uses LPTIM2 auto-reload interrupt to turn LEDs ON, compare match interrupt to turn them OFF after ~150ms (`BLINK_ON_TICKS` = 38 ticks at 256 Hz). This gives a quick pulse every ~3.9 seconds
 - All PWM start/stop calls use `LPTIM_CHANNEL_1` (STM32U5 per-channel LPTIM API)
+- `HAL_LPTIM_CompareMatchCallback` in main.c handles the OFF transition for LPTIM2
 
 ### LPModes (LPModes.h / LPModes.c)
 - `LPModes_Sleep()` — regular Sleep mode (~1-3mA), used during boot/recording

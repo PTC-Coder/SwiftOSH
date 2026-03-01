@@ -4,10 +4,10 @@
 
 #include "stm32u5xx_hal.h"
 
-#define __SWIFT_FIRMWARE_VERSION_MAIN   (0x02)
+#define __SWIFT_FIRMWARE_VERSION_MAIN   (0x01)
 #define __SWIFT_FIRMWARE_VERSION_SUB1   (0x00)
-#define __SWIFT_FIRMWARE_VERSION_SUB2   (0x00)
-#define __SWIFT_FIRMWARE_VERSION_RC     (0x01)
+#define __SWIFT_FIRMWARE_VERSION_SUB2   (0x03)
+#define __SWIFT_FIRMWARE_VERSION_RC     (0x14 )
 
 typedef struct {
   uint8_t Codec_GAIN;

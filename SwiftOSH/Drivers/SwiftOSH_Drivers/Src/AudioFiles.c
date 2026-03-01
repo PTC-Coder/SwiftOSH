@@ -28,6 +28,9 @@ uint8_t AudioFiles_MountSDCard(SWIFT_ERRORS *SwiftError)
   SwiftError->CallingFunction = FUNC_AudioFiles_MountSDCard;
   SwiftError->FatFsResult = FR_OK;
 
+  /* Unlink any previously linked driver so retries don't leak slots */
+  FATFS_UnLinkDriver(SD_Path);
+
   retSD = FATFS_LinkDriver(&SD_Driver, SD_Path);
   if (retSD != 0)
   {

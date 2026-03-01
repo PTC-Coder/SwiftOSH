@@ -5,6 +5,7 @@
   ******************************************************************************
   */
 #include "bsp_driver_sd.h"
+#include "main.h"
 
 extern SD_HandleTypeDef hsd1;
 
@@ -110,6 +111,10 @@ __weak void BSP_SD_ReadCpltCallback(void) {}
 
 __weak uint8_t BSP_SD_IsDetected(void)
 {
-  __IO uint8_t status = SD_PRESENT;
-  return status;
+  /* PC13 = SDMMC1.DETECT — most sockets pull low when card is inserted.
+     External pull-up expected on the board (GPIO configured with no internal pull). */
+  if (HAL_GPIO_ReadPin(SDCARD_DETECT_GPIO_Port, SDCARD_DETECT_Pin) == GPIO_PIN_RESET)
+    return SD_PRESENT;
+  else
+    return SD_NOT_PRESENT;
 }

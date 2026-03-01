@@ -26,8 +26,8 @@ extern "C" {
 #define USBD_LPM_ENABLED               0U
 #define USBD_SELF_POWERED              1U
 
-/* Custom HID specific */
-#define USBD_CUSTOMHID_OUTREPORT_BUF_SIZE  49U
+/* Custom HID specific - match SwiftOne settings exactly */
+#define USBD_CUSTOMHID_OUTREPORT_BUF_SIZE  64U   /* Large enough for all OUT reports (max 48 bytes + report ID) */
 #define USBD_CUSTOM_HID_REPORT_DESC_SIZE  251U
 #define CUSTOM_HID_FS_BINTERVAL           0x05U
 

@@ -12,7 +12,7 @@
 #define USBD_LANGID_STRING          1033
 #define USBD_MANUFACTURER_STRING    "LabOfOrnithologyCCB"
 #define USBD_PID_FS                 0x5751  /* ST Custom HID */
-#define USBD_PRODUCT_STRING_FS      "SwiftOSH Recorder"
+#define USBD_PRODUCT_STRING_FS      "SwiftOne Recorder"
 #define USBD_CONFIGURATION_STRING_FS "Custom HID Config"
 #define USBD_INTERFACE_STRING_FS    "Custom HID Interface"
 

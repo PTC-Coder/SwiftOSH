@@ -1,10 +1,10 @@
 /* StatusLED.c — SwiftOSH (STM32U545RET6Q)
  * Ported from SwiftOne StatusLED.c
  *
- * SwiftOSH LED pins (active-high):
- *   RED   = PC1
- *   GREEN = PA1
- *   BLUE  = PA2
+ * SwiftOSH LED polarities (all active-high):
+ *   RED   = PC1 (SET=ON, RESET=OFF)
+ *   GREEN = PA1 (SET=ON, RESET=OFF)
+ *   BLUE  = PA2 (SET=ON, RESET=OFF)
  *
  * On the original SwiftOne, LPTIM2 PWM output was hardware-routed to LED
  * pins via AF14. On STM32U545, the LED pins don't have LPTIM2 AF mapping,
@@ -15,8 +15,8 @@
 #include "main.h"
 #include "StatusLED.h"
 
-#define BLINK_PERIOD  (uint32_t)(1000 - 1)  /* ~1s at LSE/128 = 256 Hz */
-#define BLINK_COMPARE (uint32_t)(20 - 1)
+#define BLINK_PERIOD  (uint32_t)(1000 - 1)  /* ~3.9s at LSE/128 = 256 Hz */
+#define BLINK_ON_TICKS (uint32_t)(38 - 1)  /* ~150ms ON pulse */
 
 LPTIM_HandleTypeDef hlptim2;
 
@@ -43,7 +43,7 @@ void StatusLED_Initialize(void)
 
     /* Configure OC channel 1 for compare/polarity */
     LPTIM_OC_ConfigTypeDef sOCConfig = {0};
-    sOCConfig.Pulse      = BLINK_COMPARE;
+    sOCConfig.Pulse      = BLINK_ON_TICKS;
     sOCConfig.OCPolarity  = LPTIM_OCPOLARITY_LOW;
     HAL_LPTIM_OC_ConfigChannel(&hlptim2, &sOCConfig, LPTIM_CHANNEL_1);
 
@@ -62,10 +62,10 @@ static void StartBlink(uint8_t red, uint8_t grn, uint8_t blu)
     led_blink_grn = grn;
     led_blink_blu = blu;
 
-    /* Turn off all LEDs first */
-    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);
+    /* Turn off all LEDs first (all active-high: RESET = OFF) */
+    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_RESET);
 
     /* Start LPTIM2 PWM — the auto-reload interrupt will toggle LEDs */
     HAL_LPTIM_PWM_Start_IT(&hlptim2, LPTIM_CHANNEL_1);
@@ -78,9 +78,9 @@ void StatusLED_AllOutputs(void)
     led_blink_grn = 0;
     led_blink_blu = 0;
 
-    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_RESET);   /* RED off */
+    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);  /* GREEN off */
+    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_RESET);  /* BLUE off */
 }
 
 void StatusLED_LowBatteryMode(void)
@@ -123,25 +123,25 @@ void StatusLED_SolidBlueLED(void)
 {
     HAL_LPTIM_PWM_Stop(&hlptim2, LPTIM_CHANNEL_1);
     led_blink_red = 0; led_blink_grn = 0; led_blink_blu = 0;
-    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_RESET);   /* RED off */
+    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);  /* GREEN off */
+    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);     /* BLUE on */
 }
 
 void StatusLED_SolidGreenLED(void)
 {
     HAL_LPTIM_PWM_Stop(&hlptim2, LPTIM_CHANNEL_1);
     led_blink_red = 0; led_blink_grn = 0; led_blink_blu = 0;
-    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_RESET);   /* RED off */
+    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_SET);    /* GREEN on */
+    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_RESET);  /* BLUE off */
 }
 
 void StatusLED_SolidAllLED(void)
 {
     HAL_LPTIM_PWM_Stop(&hlptim2, LPTIM_CHANNEL_1);
     led_blink_red = 0; led_blink_grn = 0; led_blink_blu = 0;
-    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);     /* RED on (active-high) */
+    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);   /* GREEN on (active-low) */
+    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);     /* BLUE on (active-high) */
 }

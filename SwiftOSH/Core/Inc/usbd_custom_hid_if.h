@@ -15,6 +15,9 @@ extern "C" {
 
 extern USBD_CUSTOM_HID_ItfTypeDef USBD_CustomHID_fops_FS;
 
+/* Call from main loop to process deferred flash operations */
+void USB_HID_ProcessFlash(void);
+
 #ifdef __cplusplus
 }
 #endif

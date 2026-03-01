@@ -126,16 +126,22 @@ void HAL_SD_MspInit(SD_HandleTypeDef *hsd)
     __HAL_RCC_GPIOD_CLK_ENABLE();
 
     GPIO_InitTypeDef g = {0};
-    /* PC8=D0, PC9=D1, PC10=D2, PC11=D3, PC12=CLK */
-    g.Pin       = GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
+    /* PC8=D0, PC9=D1, PC10=D2, PC11=D3 — need pull-ups for SD protocol */
+    g.Pin       = GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11;
     g.Mode      = GPIO_MODE_AF_PP;
-    g.Pull      = GPIO_NOPULL;
-    g.Speed     = GPIO_SPEED_FREQ_HIGH;
+    g.Pull      = GPIO_PULLUP;
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
     g.Alternate = GPIO_AF12_SDMMC1;
     HAL_GPIO_Init(GPIOC, &g);
 
-    /* PD2=CMD */
-    g.Pin = GPIO_PIN_2;
+    /* PC12=CLK — no pull-up on clock line */
+    g.Pin  = GPIO_PIN_12;
+    g.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &g);
+
+    /* PD2=CMD — needs pull-up */
+    g.Pin  = GPIO_PIN_2;
+    g.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOD, &g);
 
     HAL_NVIC_SetPriority(SDMMC1_IRQn, 5, 0);
