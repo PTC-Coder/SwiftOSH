@@ -14,7 +14,10 @@
 - Peripheral handles: `h<peripheral>` (e.g., `hi2c1`, `hsai_BlockA1`, `hsd1`, `hrtc`)
 - GPIO pin defines: `<FUNCTION>_Pin` and `<FUNCTION>_GPIO_Port` in main.h
 - FreeRTOS tasks: `<Name>Task(void const *argument)` with matching `<Name>Handle` osThreadId
-- Event group bits: `<NAME>_SIGNAL` defines using bit shifts
+- Event group bits: `<NAME>_SIGNAL` defines using bit shifts. Key bits:
+  - `BUTTON_SIGNAL` (bit 2) — confirmed long-press, consumed by recording tasks
+  - `SD_INSERTED_SIGNAL` (bit 17) — SD card hot-insertion, set by PC13 falling EXTI
+  - `BUTTON_PRESS_SIGNAL` (bit 18) — raw button falling edge from ISR, consumed by ButtonTask only
 - Driver functions: `<Module>_<Action>()` (e.g., `AudioCodec_Initialize()`, `SwiftSettings_GetWAVFileAttributes()`)
 
 ## Flash Memory Layout (STM32U545, 512KB dual-bank, 2 × 32 pages × 8KB)
@@ -62,7 +65,41 @@ When porting code from the original SwiftOne (STM32L4R9):
 - `HAL_GPDMA_MODULE_ENABLED` must be disabled (commented out) — `stm32u5xx_hal_gpdma.h` does not exist in HAL V1.7.0. V1.7.0 uses `stm32u5xx_hal_dma.h` via `HAL_DMA_MODULE_ENABLED`
 - `USE_HAL_SAI_REGISTER_CALLBACKS` must be `1U` — required for `HAL_SAI_RegisterCallback()` to exist
 
-## FatFS Build Notes
+## LPTIM2 LED Blink Rules (CRITICAL)
+
+- LPTIM2 clock source MUST be `RCC_LPTIM2CLKSOURCE_LSE` in `SystemClock_Config()`. Without this it defaults to PCLK1 (80 MHz) and the blink period is ~1.6ms — appears solid, not blinking
+- `HAL_LPTIM_MspInit` MUST have an `LPTIM2` branch: enable clock (`__HAL_RCC_LPTIM2_CLK_ENABLE()`), set NVIC priority, enable IRQ. Without this branch, the LPTIM2 interrupt never fires
+- The LPTIM2 MSP branch does NOT configure any GPIO AF pins — LED toggling is done in software from interrupt callbacks
+- `HAL_LPTIM_AutoReloadMatchCallback` in main.c turns LEDs ON at the start of each blink period
+- `HAL_LPTIM_CompareMatchCallback` in main.c turns LEDs OFF after `BLINK_ON_TICKS` (~150ms)
+- Both callbacks use explicit `GPIO_PIN_SET`/`GPIO_PIN_RESET` — NEVER `HAL_GPIO_TogglePin` (unpredictable state)
+- `BLINK_PERIOD = 768-1` (3s at LSE/128 = 256 Hz), `BLINK_ON_TICKS = 38-1` (~150ms ON pulse)
+
+## Button Handling Rules
+
+- The pushbutton (PC6) MUST be configured as plain `GPIO_MODE_IT_FALLING` with `GPIO_PULLUP` — NOT as LPTIM1 ETR (AF1)
+- When PC6 is configured as AF, `HAL_GPIO_ReadPin` always returns 0 regardless of physical state — making hold detection impossible
+- `HAL_GPIO_EXTI_Falling_Callback` handles both PC6 (button) and PC13 (SD detect) — both must be in the same callback
+- The ISR sets `BUTTON_PRESS_SIGNAL` (bit 18) only — it does NOT set `BUTTON_SIGNAL` directly
+- `ButtonTask` implements the hold detection: waits on `BUTTON_PRESS_SIGNAL`, delays 1500ms, reads PC6. If still low → solid blue 1s feedback → sets `BUTTON_SIGNAL`. Short presses are silently discarded
+- After the hold check, always clear `BUTTON_PRESS_SIGNAL` to discard any accumulated events during the wait
+- LPTIM1 is still initialized for Stop-2 wakeup — its MSP must NOT configure PC6 as AF GPIO
+
+## ISR / Callback Safety Rules
+
+- `GetBatteryVoltage()` MUST NEVER be called from any ISR or HAL callback context. It uses `HAL_Delay(5)`, `MX_ADC1_Init()`, ADC calibration, and polling — all blocking. Calling it from an ISR stalls the USB interrupt and starves other operations
+- Battery voltage for USB GET_REPORT: use `g_CachedBatteryVoltage` (updated every 10s from the USB main loop)
+- Battery voltage for recording mode: call `GetBatteryVoltage()` from task context only (e.g., `InitializeFATTask` before recording starts)
+- Do NOT call `HAL_LPTIM_SetOnce_Start_IT()` or any HAL init function from within `HAL_LPTIM_AutoReloadMatchCallback` — re-arming LPTIM from its own ISR can cause re-entrancy issues
+
+## STM32CubeIDE Debug Configuration
+
+For ST-Link debugging to work correctly:
+- SWD frequency: 8000 kHz (140 kHz is too slow and causes connection issues)
+- Reset behaviour: Software system reset
+- RTOS Kernel Awareness: FreeRTOS / ARM_CM33
+- RTOS Proxy: UNCHECKED — enabling it causes "Remote replied unexpectedly to 'vMustReplyEmpty': timeout" on port 60000
+- USB DFU flashing (hex file via STM32CubeProgrammer) always works correctly regardless of debug config
 
 - With exFAT + LFN enabled, compile ONLY `option/unicode.c` — do NOT compile `option/ccsbcs.c` alongside it. Both define `ff_convert` and `ff_wtoupper`, causing multiple-definition linker errors. `ccsbcs.c` is excluded in both the `.cproject` and Makefile
 

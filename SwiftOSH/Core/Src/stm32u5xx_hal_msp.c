@@ -71,17 +71,15 @@ void HAL_LPTIM_MspInit(LPTIM_HandleTypeDef *hlptim)
   if (hlptim->Instance == LPTIM1)
   {
     __HAL_RCC_LPTIM1_CLK_ENABLE();
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-    /* PC6 = pushbutton -> LPTIM1_ETR (check AF table for U545) */
-    GPIO_InitTypeDef g = {0};
-    g.Pin       = GPIO_PIN_6;
-    g.Mode      = GPIO_MODE_AF_PP;
-    g.Pull      = GPIO_PULLUP;
-    g.Speed     = GPIO_SPEED_FREQ_LOW;
-    g.Alternate = GPIO_AF1_LPTIM1;
-    HAL_GPIO_Init(GPIOC, &g);
     HAL_NVIC_SetPriority(LPTIM1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(LPTIM1_IRQn);
+  }
+  else if (hlptim->Instance == LPTIM2)
+  {
+    /* LPTIM2 used for LED blink timing — no GPIO AF, just clock + IRQ */
+    __HAL_RCC_LPTIM2_CLK_ENABLE();
+    HAL_NVIC_SetPriority(LPTIM2_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(LPTIM2_IRQn);
   }
 }
 
@@ -92,6 +90,11 @@ void HAL_LPTIM_MspDeInit(LPTIM_HandleTypeDef *hlptim)
     __HAL_RCC_LPTIM1_CLK_DISABLE();
     HAL_GPIO_DeInit(GPIOC, GPIO_PIN_6);
     HAL_NVIC_DisableIRQ(LPTIM1_IRQn);
+  }
+  else if (hlptim->Instance == LPTIM2)
+  {
+    __HAL_RCC_LPTIM2_CLK_DISABLE();
+    HAL_NVIC_DisableIRQ(LPTIM2_IRQn);
   }
 }
 

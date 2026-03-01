@@ -15,8 +15,8 @@
 #include "main.h"
 #include "StatusLED.h"
 
-#define BLINK_PERIOD  (uint32_t)(1000 - 1)  /* ~3.9s at LSE/128 = 256 Hz */
-#define BLINK_ON_TICKS (uint32_t)(38 - 1)  /* ~150ms ON pulse */
+#define BLINK_PERIOD   (uint32_t)(768 - 1)  /* 3s at LSE/128 = 256 Hz */
+#define BLINK_ON_TICKS (uint32_t)(38 - 1)   /* ~150ms ON pulse */
 
 LPTIM_HandleTypeDef hlptim2;
 
@@ -27,8 +27,6 @@ volatile uint8_t led_blink_blu;
 
 void StatusLED_Initialize(void)
 {
-    __HAL_RCC_LPTIM2_CLK_ENABLE();
-
     hlptim2.Instance = LPTIM2;
     hlptim2.Init.Clock.Source    = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC;
     hlptim2.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV128;
@@ -39,16 +37,14 @@ void StatusLED_Initialize(void)
     hlptim2.Init.Input1Source    = LPTIM_INPUT1SOURCE_GPIO;
     hlptim2.Init.Input2Source    = LPTIM_INPUT2SOURCE_GPIO;
     hlptim2.Init.RepetitionCounter = 0;
+    /* HAL_LPTIM_MspInit will enable LPTIM2 clock and NVIC */
     HAL_LPTIM_Init(&hlptim2);
 
-    /* Configure OC channel 1 for compare/polarity */
+    /* Configure OC channel 1 for compare match (used for LED OFF pulse) */
     LPTIM_OC_ConfigTypeDef sOCConfig = {0};
     sOCConfig.Pulse      = BLINK_ON_TICKS;
-    sOCConfig.OCPolarity  = LPTIM_OCPOLARITY_LOW;
+    sOCConfig.OCPolarity = LPTIM_OCPOLARITY_LOW;
     HAL_LPTIM_OC_ConfigChannel(&hlptim2, &sOCConfig, LPTIM_CHANNEL_1);
-
-    HAL_NVIC_SetPriority(LPTIM2_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(LPTIM2_IRQn);
 
     led_blink_red = 0;
     led_blink_grn = 0;
@@ -141,7 +137,7 @@ void StatusLED_SolidAllLED(void)
 {
     HAL_LPTIM_PWM_Stop(&hlptim2, LPTIM_CHANNEL_1);
     led_blink_red = 0; led_blink_grn = 0; led_blink_blu = 0;
-    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);     /* RED on (active-high) */
-    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);   /* GREEN on (active-low) */
-    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);     /* BLUE on (active-high) */
+    HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);    /* RED on (active-high) */
+    HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_SET);   /* GREEN on (active-high) */
+    HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);   /* BLUE on (active-high) */
 }

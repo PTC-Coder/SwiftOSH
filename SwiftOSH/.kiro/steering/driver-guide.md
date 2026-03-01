@@ -106,9 +106,12 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - `StatusLED_SolidBlueLED()` / `SolidGreenLED()` / `SolidAllLED()` — solid LED states
 - `StatusLED_AllOutputs()` — stops LPTIM2, turns all LEDs off
 - `StatusLED_LowBatteryMode()` — stops LPTIM2 for manual LED control in low-battery task
-- Uses LPTIM2 auto-reload interrupt to turn LEDs ON, compare match interrupt to turn them OFF after ~150ms (`BLINK_ON_TICKS` = 38 ticks at 256 Hz). This gives a quick pulse every ~3.9 seconds
+- Uses LPTIM2 auto-reload interrupt to turn LEDs ON, compare match interrupt to turn them OFF after ~150ms (`BLINK_ON_TICKS = 38-1` ticks at 256 Hz). `BLINK_PERIOD = 768-1` gives 3s period at LSE/128 = 256 Hz
+- LPTIM2 clock source MUST be `RCC_LPTIM2CLKSOURCE_LSE` in `SystemClock_Config()` — defaults to PCLK1 (80 MHz) otherwise, making blink period ~1.6ms (appears solid)
+- `HAL_LPTIM_MspInit` MUST have an LPTIM2 branch (clock enable + NVIC only, no GPIO AF)
+- `HAL_LPTIM_AutoReloadMatchCallback` and `HAL_LPTIM_CompareMatchCallback` live in main.c (not StatusLED.c) — they reference `led_blink_red/grn/blu` via `extern volatile uint8_t`
 - All PWM start/stop calls use `LPTIM_CHANNEL_1` (STM32U5 per-channel LPTIM API)
-- `HAL_LPTIM_CompareMatchCallback` in main.c handles the OFF transition for LPTIM2
+- All LED GPIO writes use explicit `GPIO_PIN_SET`/`GPIO_PIN_RESET` — NEVER `HAL_GPIO_TogglePin`
 
 ### LPModes (LPModes.h / LPModes.c)
 - `LPModes_Sleep()` — regular Sleep mode (~1-3mA), used during boot/recording

@@ -43,6 +43,7 @@ osThreadId BlinkLEDHandle;
 osThreadId InitializeScheduleHandle;
 osThreadId VoiceMemoHandle;
 osThreadId LowBatteryHandle;
+osThreadId ButtonHandle;
 
 /* ---- Event-group bit definitions (same as original) ---- */
 #define ALARM_A_SIGNAL        ( 1 << 1 )
@@ -61,6 +62,8 @@ osThreadId LowBatteryHandle;
 #define DST_EVENT_SIGNAL      ( 1 << 14 )
 #define REDBLUGRN_LED_SIGNAL  ( 1 << 15 )
 #define BLUBLUGRN_LED_SIGNAL  ( 1 << 16 )
+#define SD_INSERTED_SIGNAL    ( 1 << 17 )
+#define BUTTON_PRESS_SIGNAL   ( 1 << 18 )  /* raw ISR event — ButtonTask checks hold duration */
 
 /* ---- DMA audio buffer ---- */
 #define BUFFER_SIZE       32768
@@ -107,6 +110,7 @@ void BlinkLEDTask(void const *argument);
 void InitializeScheduleTask(void const *argument);
 void NewVoiceMemoTask(void const *argument);
 void LowBatteryTask(void const *argument);
+void ButtonTask(void const *argument);
 
 static void InitializeCodecAndDMA(void);
 static void WriteSystemLog(const char *inputString);
@@ -171,13 +175,15 @@ void SystemClock_Config(void)
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
     Error_Handler();
 
-  /* Peripheral clocks: RTC=LSE, LPTIM1=LSE, I2C1=PCLK1, SAI1=PLL2,
+  /* Peripheral clocks: RTC=LSE, LPTIM1=LSE, LPTIM2=LSE, I2C1=PCLK1, SAI1=PLL2,
      SDMMC1=PLL1-P, ADC=SYSCLK */
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC  | RCC_PERIPHCLK_LPTIM1 |
-                                       RCC_PERIPHCLK_I2C1 | RCC_PERIPHCLK_SAI1   |
-                                       RCC_PERIPHCLK_SDMMC | RCC_PERIPHCLK_ADCDAC;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC   | RCC_PERIPHCLK_LPTIM1 |
+                                       RCC_PERIPHCLK_LPTIM2 | RCC_PERIPHCLK_I2C1  |
+                                       RCC_PERIPHCLK_SAI1   | RCC_PERIPHCLK_SDMMC |
+                                       RCC_PERIPHCLK_ADCDAC;
   PeriphClkInit.RTCClockSelection    = RCC_RTCCLKSOURCE_LSE;
   PeriphClkInit.Lptim1ClockSelection = RCC_LPTIM1CLKSOURCE_LSE;
+  PeriphClkInit.Lptim2ClockSelection = RCC_LPTIM2CLKSOURCE_LSE;
   PeriphClkInit.I2c1ClockSelection   = RCC_I2C1CLKSOURCE_PCLK1;
   PeriphClkInit.SdmmcClockSelection  = RCC_SDMMCCLKSOURCE_PLL1;
   PeriphClkInit.AdcDacClockSelection = RCC_ADCDACCLKSOURCE_SYSCLK;
@@ -364,6 +370,12 @@ static void MX_LPTIM1_Init(void)
   hlptim1.Init.Input2Source    = LPTIM_INPUT2SOURCE_GPIO;
   if (HAL_LPTIM_Init(&hlptim1) != HAL_OK)
     Error_Handler();
+
+  /* Start in one-shot mode with interrupt — button falling edge (ETR/TRIGSOURCE_0)
+     triggers a single count-up to Period; AutoReloadMatchCallback fires if button
+     is still held. On STM32U5 HAL, SetOnce_Start_IT takes (hlptim, Channel). */
+  if (HAL_LPTIM_SetOnce_Start_IT(&hlptim1, LPTIM_CHANNEL_1) != HAL_OK)
+    Error_Handler();
 }
 
 static void MX_SAI1_Init(uint32_t AudioSampleRate)
@@ -464,12 +476,26 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   HAL_GPIO_Init(ADC_EN_GPIO_Port, &GPIO_InitStruct);
 
+  /* VBAT_MONITOR_EN (PB5) — enable battery voltage divider */
+  HAL_GPIO_WritePin(VBAT_MONITOR_GPIO_Port, VBAT_MONITOR_Pin, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin  = VBAT_MONITOR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  HAL_GPIO_Init(VBAT_MONITOR_GPIO_Port, &GPIO_InitStruct);
+
   /* PS/SYNC (PC2) — low for power-save mode */
   HAL_GPIO_WritePin(PS_SYNC_GPIO_Port, PS_SYNC_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin  = PS_SYNC_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(PS_SYNC_GPIO_Port, &GPIO_InitStruct);
+
+  /* Pushbutton (PC6) — falling-edge EXTI, internal pull-up */
+  GPIO_InitStruct.Pin  = PUSHBUTTON_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(PUSHBUTTON_GPIO_Port, &GPIO_InitStruct);
+  HAL_NVIC_SetPriority(EXTI6_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI6_IRQn);
 
   /* Hall-effect switch (PC0) — rising-edge EXTI */
   GPIO_InitStruct.Pin  = HALL_EFFECT_Pin;
@@ -505,6 +531,7 @@ static void MX_GPIO_Init_USB(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* Blue LED solid on when USB connected */
@@ -513,7 +540,21 @@ static void MX_GPIO_Init_USB(void)
   GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(BLU_LED_GPIO_Port, &GPIO_InitStruct);
-  HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);  /* Try SET */
+  HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);
+
+  /* VBAT_SCALED (PA0) — analog input for ADC */
+  GPIO_InitStruct.Pin  = VBAT_SCALED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(VBAT_SCALED_GPIO_Port, &GPIO_InitStruct);
+
+  /* ADC_EN (PB15) and VBAT_MONITOR_EN (PB5) — output, default LOW */
+  HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(VBAT_MONITOR_GPIO_Port, VBAT_MONITOR_Pin, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin  = ADC_EN_Pin | VBAT_MONITOR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
 /* ================================================================== */
@@ -523,6 +564,11 @@ static void MX_GPIO_Init_USB(void)
 float GetBatteryVoltage(void)
 {
   float battery_v = -1.0f;
+
+  /* Enable battery voltage divider */
+  HAL_GPIO_WritePin(VBAT_MONITOR_GPIO_Port, VBAT_MONITOR_Pin, GPIO_PIN_SET);
+  HAL_Delay(5);  /* settling time */
+
   MX_ADC1_Init();
 
   uint16_t raw = 0;
@@ -535,6 +581,10 @@ float GetBatteryVoltage(void)
     battery_v = (raw * 3.3f / 4095.0f) * 3.778f;
   }
   HAL_ADC_DeInit(&hadc1);
+
+  /* Disable voltage divider to save power */
+  HAL_GPIO_WritePin(VBAT_MONITOR_GPIO_Port, VBAT_MONITOR_Pin, GPIO_PIN_RESET);
+
   return battery_v;
 }
 
@@ -572,6 +622,30 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
   }
 }
 
+void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
+{
+  /* PC6 falling = button pressed — ButtonTask will confirm 1.5s hold */
+  if (GPIO_Pin == PUSHBUTTON_Pin)
+  {
+    if (xEventGroup != NULL)
+    {
+      BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+      xEventGroupSetBitsFromISR(xEventGroup, BUTTON_PRESS_SIGNAL, &xHigherPriorityTaskWoken);
+      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+  }
+  /* PC13 falling = SD card inserted (active-low detect, external pull-up) */
+  else if (GPIO_Pin == SDCARD_DETECT_Pin)
+  {
+    if (xEventGroup != NULL)
+    {
+      BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+      xEventGroupSetBitsFromISR(xEventGroup, SD_INSERTED_SIGNAL, &xHigherPriorityTaskWoken);
+      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+  }
+}
+
 void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtclock)
 {
   (void)hrtclock;
@@ -585,12 +659,9 @@ void HAL_RTCEx_AlarmBEventCallback(RTC_HandleTypeDef *hrtclock)
   (void)hrtclock;
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-  /* Check battery voltage at midnight */
-  float batteryVoltage = GetBatteryVoltage();
-  if (batteryVoltage <= 3.0f)
-  {
-    xEventGroupSetBitsFromISR(xEventGroup, LOW_BATTERY_SIGNAL, &xHigherPriorityTaskWoken);
-  }
+  /* NOTE: Battery voltage check removed from ISR — GetBatteryVoltage() uses
+     HAL_Delay and blocking ADC, both illegal in ISR context. Low battery is
+     checked in InitializeFATTask before recording starts. */
 
   /* DST day-of-year tracking */
   DSTSettings.Current_DOY++;
@@ -636,17 +707,34 @@ void HAL_LPTIM_AutoReloadMatchCallback(LPTIM_HandleTypeDef *hlptim)
       xEventGroupSetBitsFromISR(xEventGroup, BUTTON_SIGNAL, &xHigherPriorityTaskWoken);
       portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
+    /* Re-arm one-shot so next button press is detected */
+    HAL_LPTIM_SetOnce_Start_IT(&hlptim1, LPTIM_CHANNEL_1);
   }
   else if (hlptim->Instance == LPTIM2)
   {
-    /* StatusLED blink toggle — called from LPTIM2 IRQ */
+    /* Auto-reload fires at start of each blink period — turn LEDs ON */
     extern volatile uint8_t led_blink_red, led_blink_grn, led_blink_blu;
     if (led_blink_red)
-      HAL_GPIO_TogglePin(RED_LED_GPIO_Port, RED_LED_Pin);
+      HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_SET);
     if (led_blink_grn)
-      HAL_GPIO_TogglePin(GRN_LED_GPIO_Port, GRN_LED_Pin);
+      HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_SET);
     if (led_blink_blu)
-      HAL_GPIO_TogglePin(BLU_LED_GPIO_Port, BLU_LED_Pin);
+      HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_SET);
+  }
+}
+
+void HAL_LPTIM_CompareMatchCallback(LPTIM_HandleTypeDef *hlptim)
+{
+  if (hlptim->Instance == LPTIM2)
+  {
+    /* Compare fires after BLINK_ON_TICKS (~150ms) — turn LEDs OFF */
+    extern volatile uint8_t led_blink_red, led_blink_grn, led_blink_blu;
+    if (led_blink_red)
+      HAL_GPIO_WritePin(RED_LED_GPIO_Port, RED_LED_Pin, GPIO_PIN_RESET);
+    if (led_blink_grn)
+      HAL_GPIO_WritePin(GRN_LED_GPIO_Port, GRN_LED_Pin, GPIO_PIN_RESET);
+    if (led_blink_blu)
+      HAL_GPIO_WritePin(BLU_LED_GPIO_Port, BLU_LED_Pin, GPIO_PIN_RESET);
   }
 }
 
@@ -700,6 +788,10 @@ void InitializeFATTask(void const *argument)
   /* Create LED blink task */
   osThreadDef(BlinkLED, BlinkLEDTask, osPriorityAboveNormal, 0, 128);
   BlinkLEDHandle = osThreadCreate(osThread(BlinkLED), NULL);
+
+  /* Create button hold task */
+  osThreadDef(Button, ButtonTask, osPriorityAboveNormal, 0, 128);
+  ButtonHandle = osThreadCreate(osThread(Button), NULL);
 
   /* Create error task (suspended) */
   osThreadDef(Error, ErrorTask, osPriorityBelowNormal, 0, 128);
@@ -879,6 +971,7 @@ void RecordLoopTask(void const *argument)
         __HAL_RCC_I2C1_CLK_ENABLE();
         AudioCodec_SleepMode(&hi2c1);
         __HAL_RCC_I2C1_CLK_DISABLE();
+        HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_RESET);
 
         osThreadResume(StandbyHandle);
       }
@@ -925,6 +1018,7 @@ void RecordLoopTask(void const *argument)
         __HAL_RCC_I2C1_CLK_ENABLE();
         AudioCodec_SleepMode(&hi2c1);
         __HAL_RCC_I2C1_CLK_DISABLE();
+        HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_RESET);
 
         osThreadResume(StandbyHandle);
         osThreadSuspend(NULL);
@@ -949,6 +1043,7 @@ void RecordLoopTask(void const *argument)
       __HAL_RCC_I2C1_CLK_ENABLE();
       AudioCodec_SleepMode(&hi2c1);
       __HAL_RCC_I2C1_CLK_DISABLE();
+      HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_RESET);
 
       osThreadResume(StandbyHandle);
       osThreadSuspend(NULL);
@@ -1189,6 +1284,9 @@ static void InitializeCodecAndDMA(void)
 {
   g_stop2Allowed = 0;
 
+  /* Enable ADC power supply (PB15 active-high) before codec init */
+  HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_SET);
+
   __HAL_RCC_I2C1_CLK_ENABLE();
   AudioCodec_Initialize(&hi2c1);
   __HAL_RCC_I2C1_CLK_DISABLE();
@@ -1419,6 +1517,7 @@ void InitializeScheduleTask(void const *argument)
       __HAL_RCC_I2C1_CLK_ENABLE();
       AudioCodec_SleepMode(&hi2c1);
       __HAL_RCC_I2C1_CLK_DISABLE();
+      HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_RESET);
       osThreadResume(StandbyHandle);
       osThreadSuspend(NULL);
       break;
@@ -1506,6 +1605,32 @@ void NewVoiceMemoTask(void const *argument)
     RTC_DeactivateAlarm(RTC_ALARM_A);
     osThreadResume(InitializeScheduleHandle);
     osThreadTerminate(VoiceMemoHandle);
+  }
+}
+
+/**
+  * @brief  Button hold task — waits for raw press event, confirms 1.5s hold,
+  *         then sets BUTTON_SIGNAL. Ignores short presses.
+  */
+void ButtonTask(void const *argument)
+{
+  (void)argument;
+  for (;;)
+  {
+    /* Wait for falling edge from ISR */
+    xEventGroupWaitBits(xEventGroup, BUTTON_PRESS_SIGNAL, pdTRUE, pdFALSE, osWaitForever);
+
+    /* Wait 1.5s then check if button is still held (PC6 low = pressed) */
+    osDelay(1500);
+    if (HAL_GPIO_ReadPin(PUSHBUTTON_GPIO_Port, PUSHBUTTON_Pin) == GPIO_PIN_RESET)
+    {
+      /* Solid blue for 1s as confirmation feedback, then blink blue */
+      StatusLED_SolidBlueLED();
+      osDelay(1000);
+      xEventGroupSetBits(xEventGroup, BUTTON_SIGNAL);
+    }
+    /* Discard any additional press events that accumulated during the hold wait */
+    xEventGroupClearBits(xEventGroup, BUTTON_PRESS_SIGNAL);
   }
 }
 
@@ -1620,7 +1745,8 @@ int main(void)
     MX_RTC_Init();
     MX_TIM6_Init();       /* HAL timebase - USB stack uses HAL_Delay */
     MX_GPIO_Init_USB();
-    MX_ADC1_Init();
+    /* Pre-populate battery cache before USB enumerates so first GET_REPORT has a valid value */
+    g_CachedBatteryVoltage = GetBatteryVoltage();
     MX_USB_DEVICE_Init();
   }
   else

@@ -108,8 +108,10 @@ The `.cproject` is configured for STM32CubeIDE v1.17.0+ managed build with:
 - HSE 12.288 MHz crystal → PLL1 ~160 MHz SYSCLK
 - PLL2 → SAI1 audio clock (exact 32/48 kHz sample rates)
 - HSI48 + CRS (trimmed from LSE) for USB mode
-- LSE 32.768 kHz for RTC and LPTIM1
-- LPTIM2 for LED blink timing (auto-reload interrupt, per-channel OC config via `HAL_LPTIM_OC_ConfigChannel`, `LPTIM_CHANNEL_1`)
+- LSE 32.768 kHz for RTC and LPTIM1 (Stop-2 wakeup timer)
+- LPTIM2 for LED blink timing — clock source MUST be `RCC_LPTIM2CLKSOURCE_LSE` in `SystemClock_Config()`. With LSE/128 prescaler = 256 Hz counter. `BLINK_PERIOD = 768-1` gives 3s period. Auto-reload interrupt turns LEDs ON; compare match interrupt (after `BLINK_ON_TICKS = 38-1` ≈ 150ms) turns them OFF. Both callbacks live in main.c
+- LPTIM1 for Stop-2 wakeup only — NOT used for button detection
+- Pushbutton: PC6 — plain EXTI falling-edge with internal pull-up (NOT LPTIM1 ETR). ISR sets `BUTTON_PRESS_SIGNAL` (bit 18); `ButtonTask` confirms 1.5s hold then sets `BUTTON_SIGNAL`
 - SAI1: PA8=BCLK, PA9=WCLK, PA10=DOUT, PB8=MCLK
 - I2C1: PB6=SCL, PB7=SDA (codec at 0x4D)
 - SDMMC1: PC8-11=D0-D3, PC12=CLK, PD2=CMD, PC13=card detect
@@ -192,8 +194,9 @@ The SwiftOne Firmware Updater app showed all zeros (SN: 00000000000, FW: 0.0.0.0
 - SD card mounts reliably with retry logic
 - SD card hot-insertion triggers reboot and re-mount
 - SDMMC re-initializes properly after Stop 2 wake-up
-- LED blink shows quick ~150ms pulse every ~4 seconds
+- LED blink shows quick ~150ms pulse every 3 seconds (BLINK_PERIOD=768 at 256 Hz)
 - Battery voltage reads correctly via ADC with voltage divider enable
+- Pushbutton long-press (1.5s hold) detected via EXTI + ButtonTask — solid blue 1s feedback then BUTTON_SIGNAL
 
 ### Key observations
 - The FreeRTOS CM33 port (`ARM_CM33_NTZ/non_secure`) hardcodes `PendSV_Handler`, `SVC_Handler`, `SysTick_Handler` as function names directly in `portasm.c` and `port.c`. The `#define` mappings in `FreeRTOSConfig.h` are redundant for this port but must remain because the port source uses those exact CMSIS names
@@ -235,9 +238,29 @@ Four issues found:
 All LEDs are active-high. Original code assumed GREEN/BLUE were active-low. Fixed all GPIO writes in StatusLED.c, BlinkLEDTask, and LowBatteryTask.
 
 ### StatusLED LPTIM2 blink too fast (RESOLVED)
-LPTIM2 kernel clock defaulted to PCLK1 (80 MHz) — blink period was 1.6ms (appeared solid). Fix: Added `RCC_LPTIM2CLKSOURCE_LSE` to `SystemClock_Config()`. Now 256 Hz counter, ~3.9s blink cycle.
+LPTIM2 kernel clock defaulted to PCLK1 (80 MHz) — blink period was 1.6ms (appeared solid). Fix: Added `RCC_LPTIM2CLKSOURCE_LSE` to `SystemClock_Config()`. Now 256 Hz counter, 3s blink cycle.
 
-### LPModes Stop2 wake-up missing PLL1-P (RESOLVED)
+LPTIM2 MSP (`HAL_LPTIM_MspInit`) MUST have an `LPTIM2` branch that enables the clock and configures NVIC. Without it, the LPTIM2 interrupt never fires and LEDs never blink. The LPTIM2 branch does NOT configure any GPIO AF pins — LED toggling is done in software from the interrupt callbacks.
+
+`HAL_LPTIM_CompareMatchCallback` in main.c handles the LED OFF transition for LPTIM2. `HAL_LPTIM_AutoReloadMatchCallback` handles the LED ON transition. Both check `hlptim->Instance == LPTIM2` and use explicit `GPIO_PIN_SET`/`GPIO_PIN_RESET` — never `HAL_GPIO_TogglePin`.
+
+`BLINK_PERIOD = 768-1` (3s at 256 Hz), `BLINK_ON_TICKS = 38-1` (~150ms ON pulse).
+
+### Pushbutton implementation (RESOLVED)
+PC6 was originally attempted as LPTIM1 ETR trigger input (AF1). This approach was abandoned because: (1) configuring PC6 as AF pin means `HAL_GPIO_ReadPin` always returns 0 regardless of physical state, (2) LPTIM1 ETR is complex and unreliable for simple button detection.
+
+Fix: PC6 configured as plain `GPIO_MODE_IT_FALLING` with `GPIO_PULLUP`. `HAL_GPIO_EXTI_Falling_Callback` handles both PC6 (button) and PC13 (SD detect). PC6 ISR sets `BUTTON_PRESS_SIGNAL` (bit 18) — a raw event that does NOT directly trigger recording stop.
+
+`ButtonTask` waits on `BUTTON_PRESS_SIGNAL`, delays 1500ms, then reads PC6. If still low (held), it calls `StatusLED_SolidBlueLED()` for 1s feedback, then sets `BUTTON_SIGNAL` (bit 2) which the recording tasks respond to. Short presses are silently ignored. Any accumulated `BUTTON_PRESS_SIGNAL` bits are cleared after the hold check.
+
+LPTIM1 is still initialized for Stop-2 wakeup timing — its MSP no longer configures PC6 as AF GPIO.
+
+### STM32CubeIDE debug configuration (RESOLVED)
+ST-Link debug was causing HardFaults when launched from the IDE play button. Correct settings:
+- SWD frequency: 8000 kHz (not 140 kHz — too slow)
+- Reset behaviour: Software system reset (not "Connect under reset")
+- RTOS Kernel Awareness: FreeRTOS / ARM_CM33 (not ThreadX/cortex_m0)
+- RTOS Proxy: UNCHECKED — enabling it causes "Remote replied unexpectedly to 'vMustReplyEmpty': timeout" on port 60000
 `LPModes_RestoreClockAfterStop2()` lost PLL1-P after reconfiguring PLL1. Fix: Added `RCC_PERIPHCLK_SDMMC` and `PLL2ClockOut` to the wake-up PeriphClkInit.
 
 ### USB SET_REPORT flash alignment bug (RESOLVED)
@@ -280,4 +303,6 @@ Fix: Added `volatile float g_CachedBatteryVoltage = -1.0f` global in `main.c`. T
 10. ~~Fix SD card detect (BSP_SD_IsDetected stub)~~ DONE
 11. ~~Fix LED blink duty cycle (too long ON time)~~ DONE
 12. ~~USB HID SET_REPORT (write settings to device)~~ DONE — deferred flash queue, 16-byte aligned offsets, verified working
-13. Port SD firmware update (SD_FW_Update) from SwiftOne
+13. ~~Fix LED blink period (LPTIM2 clock source)~~ DONE — 3s period at LSE/128 = 256 Hz
+14. ~~Pushbutton long-press detection~~ DONE — EXTI + ButtonTask, 1.5s hold, solid blue feedback
+15. Port SD firmware update (SD_FW_Update) from SwiftOne
