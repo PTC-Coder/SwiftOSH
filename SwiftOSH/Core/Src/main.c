@@ -67,9 +67,22 @@ osThreadId ButtonHandle;
 
 /* ---- DMA audio buffer ---- */
 /* BUFFER_SIZE is in bytes. DMA element count = BUFFER_SIZE / 2 (halfwords).
-   Half-complete fires at BUFFER_SIZE_DIV2 bytes = BUFFER_SIZE/4 halfwords. */
-#define BUFFER_SIZE       32768
+   Half-complete fires at BUFFER_SIZE_DIV2 bytes = BUFFER_SIZE/4 halfwords.
+
+   CRITICAL: STM32U5 GPDMA CBR1.BNDT is 16-bit — max block size = 65535 bytes.
+   Each DMA node transfers BUFFER_SIZE_DIV2 bytes, so BUFFER_SIZE_DIV2 must be <= 65535.
+
+   Using maximum allowable half-buffer = 65534 bytes (even, for 16-bit halfword alignment):
+     full buffer = 131068 bytes
+     at 96 kHz mono 16-bit: 65534 / 2 / 96000 = ~341 ms write window
+   RAM cost: ~128 KB static. */
+#define BUFFER_SIZE       131068
 #define BUFFER_SIZE_DIV2  (BUFFER_SIZE / 2)
+
+/* ---- One-off compile-time sample rate override ---- */
+/* Uncomment to force a specific sample rate regardless of flash settings.
+   Useful for testing. Remove or comment out for normal operation. */
+//#define FORCE_SAMPLE_RATE  192000
 uint8_t I2SRxBuffer[BUFFER_SIZE] __attribute__((section(".bss")));
 
 /* ---- DMA linked-list objects for circular SAI1 RX ---- */
@@ -108,6 +121,7 @@ static void MX_ADC1_Init(void);
 static void MX_LPTIM1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SAI1_Init(uint32_t AudioSampleRate);
+static void MX_SAI1_ReconfigPLL2(uint32_t AudioSampleRate);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_RTC_Init(void);
 static void MX_TIM6_Init(void);
@@ -126,10 +140,6 @@ static void InitializeCodecAndDMA(void);
 static void WriteSystemLog(const char *inputString);
 static void WriteSystemFlashLogToSD(void);
 static void WriteDebugFile(void);
-
-static void AudioTransferComplete(SAI_HandleTypeDef *hsai);
-static void AudioTransferHalfComplete(SAI_HandleTypeDef *hsai);
-static void SAI_ErrorDiag(SAI_HandleTypeDef *hsai);
 
 /* Set from ISR, logged from task context to avoid flash writes in ISR */
 static volatile uint32_t g_saiErrorCode;
@@ -190,11 +200,13 @@ void SystemClock_Config(void)
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
     Error_Handler();
 
-  /* Peripheral clocks: RTC=LSE, LPTIM1=LSE, LPTIM2=LSE, I2C1=PCLK1, SAI1=PLL2,
-     SDMMC1=PLL1-P, ADC=SYSCLK */
+  /* Peripheral clocks: RTC=LSE, LPTIM1=LSE, LPTIM2=LSE, I2C1=PCLK1,
+     SDMMC1=PLL1-P, ADC=SYSCLK.
+     SAI1 clock is NOT configured here — MX_SAI1_ReconfigPLL2() sets up PLL2
+     and switches SAI1 to it immediately before each recording session. */
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC   | RCC_PERIPHCLK_LPTIM1 |
                                        RCC_PERIPHCLK_LPTIM2 | RCC_PERIPHCLK_I2C1  |
-                                       RCC_PERIPHCLK_SAI1   | RCC_PERIPHCLK_SDMMC |
+                                       RCC_PERIPHCLK_SDMMC |
                                        RCC_PERIPHCLK_ADCDAC;
   PeriphClkInit.RTCClockSelection    = RCC_RTCCLKSOURCE_LSE;
   PeriphClkInit.Lptim1ClockSelection = RCC_LPTIM1CLKSOURCE_LSE;
@@ -202,19 +214,6 @@ void SystemClock_Config(void)
   PeriphClkInit.I2c1ClockSelection   = RCC_I2C1CLKSOURCE_PCLK1;
   PeriphClkInit.SdmmcClockSelection  = RCC_SDMMCCLKSOURCE_PLL1;
   PeriphClkInit.AdcDacClockSelection = RCC_ADCDACCLKSOURCE_SYSCLK;
-
-  /* PLL2 for SAI1: 12.288 MHz / 3 * 64 / 8 = 32.768 MHz SAI clock
-     Gives exact 32 kHz / 48 kHz sample rates */
-  PeriphClkInit.Sai1ClockSelection   = RCC_SAI1CLKSOURCE_PLL2;
-  PeriphClkInit.PLL2.PLL2Source = RCC_PLLSOURCE_HSE;
-  PeriphClkInit.PLL2.PLL2M = 3;
-  PeriphClkInit.PLL2.PLL2N = 64;
-  PeriphClkInit.PLL2.PLL2P = 8;
-  PeriphClkInit.PLL2.PLL2Q = 8;
-  PeriphClkInit.PLL2.PLL2R = 8;
-  PeriphClkInit.PLL2.PLL2RGE    = RCC_PLLVCIRANGE_1;
-  PeriphClkInit.PLL2.PLL2FRACN  = 0;
-  PeriphClkInit.PLL2.PLL2ClockOut = RCC_PLL2_DIVP;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
     Error_Handler();
 }
@@ -423,7 +422,13 @@ static void MX_SAI1_Init(uint32_t AudioSampleRate)
   hsai_BlockA1.Init.Synchro        = SAI_ASYNCHRONOUS;
   hsai_BlockA1.Init.OutputDrive    = SAI_OUTPUTDRIVE_ENABLE;
   hsai_BlockA1.Init.NoDivider      = SAI_MASTERDIVIDER_ENABLE;
-  hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_ENABLE;  /* OSR=1: doubles MCLK period for correct Fs */
+  /* MckOverSampling=ENABLE halves the effective MCKDIV (OSR=1: MCKDIV = SAI_clk / (Fs×512)).
+     For low rates (≤24kHz) this would require MCKDIV > 63 (the 6-bit field max).
+     Use DISABLE for ≤24kHz: MCKDIV = SAI_clk / (Fs×512) without the ×2 penalty.
+       OSR=DISABLE: 8kHz→24, 16kHz→12, 24kHz→8  (all ≤63 ✓)
+       OSR=ENABLE:  32kHz→6, 48kHz→4, 96kHz→2, 192kHz→1 (all ≤63 ✓) */
+  hsai_BlockA1.Init.MckOverSampling = (AudioSampleRate <= 24000) ? SAI_MCK_OVERSAMPLING_DISABLE
+                                                                  : SAI_MCK_OVERSAMPLING_ENABLE;
   hsai_BlockA1.Init.FIFOThreshold  = SAI_FIFOTHRESHOLD_EMPTY;
   hsai_BlockA1.Init.AudioFrequency = AudioSampleRate;
   hsai_BlockA1.Init.SynchroExt     = SAI_SYNCEXT_DISABLE;
@@ -448,6 +453,61 @@ static void MX_SAI1_Init(uint32_t AudioSampleRate)
   hsai_BlockA1.SlotInit.SlotActive     = SAI_SLOTACTIVE_0;  /* Mono: only left channel */
 
   if (HAL_SAI_Init(&hsai_BlockA1) != HAL_OK)
+    Error_Handler();
+}
+
+/**
+  * @brief  Reconfigure PLL2 for the requested audio sample rate before SAI init.
+  *
+  *  HSE = 12.288 MHz. One PLL2 config covers all supported rates:
+  *    PLL2M=1, PLL2N=32, PLL2P=4 → VCO=393.216 MHz, PLL2P=98.304 MHz
+  *
+  *  MCKDIV = SAI_clk / (Fs × 512) [OSR=DISABLE] or / (Fs × 1024) [OSR=ENABLE]:
+  *    OSR=DISABLE (<=24kHz):  8kHz->24, 16kHz->12, 24kHz->8   (all within 6-bit max of 63)
+  *    OSR=ENABLE  (>=32kHz): 32kHz->6, 48kHz->4,  96kHz->2, 192kHz->1
+  *
+  *  Any unsupported rate falls back to 32kHz.
+  */
+static void MX_SAI1_ReconfigPLL2(uint32_t AudioSampleRate)
+{
+  RCC_PeriphCLKInitTypeDef clk = {0};
+
+  /* Step 1: Switch SAI1 clock source away from PLL2 so PLL2 can be stopped.
+     HAL_RCCEx_PeriphCLKConfig cannot reconfigure a PLL while it is the active
+     clock source for a peripheral — it hangs waiting for PLL2RDY to clear.
+     HSI16 is always available as a safe temporary source. */
+  clk.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
+  clk.Sai1ClockSelection   = RCC_SAI1CLKSOURCE_HSI;
+  if (HAL_RCCEx_PeriphCLKConfig(&clk) != HAL_OK)
+    Error_Handler();
+
+  /* Step 2: Disable PLL2 and wait for it to stop.
+     HAL V1.7.0 has no PLL2State field — use the direct register macro. */
+  __HAL_RCC_PLL2_DISABLE();
+  uint32_t tickstart = HAL_GetTick();
+  while (__HAL_RCC_GET_FLAG(RCC_FLAG_PLL2RDY) != 0U)
+  {
+    if ((HAL_GetTick() - tickstart) > 2U)
+      break;  /* should stop in <1ms; don't hang if something is wrong */
+  }
+
+  /* Step 3: Reconfigure PLL2 and switch SAI1 back to it.
+     HAL_RCCEx_PeriphCLKConfig handles enabling PLL2 and waiting for lock.
+     HSE = 12.288 MHz. PLL2M=1, PLL2N=32, PLL2P=4 → 98.304 MHz.
+     BCLK = 64 × Fs. MCKDIV = 98304000 / (Fs × 64):
+       8kHz→192, 16kHz→96, 24kHz→64, 32kHz→48, 48kHz→32, 96kHz→16, 192kHz→8 */
+  clk.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
+  clk.Sai1ClockSelection   = RCC_SAI1CLKSOURCE_PLL2;
+  clk.PLL2.PLL2Source      = RCC_PLLSOURCE_HSE;
+  clk.PLL2.PLL2M           = 1;   /* 12.288 MHz / 1 = 12.288 MHz ref */
+  clk.PLL2.PLL2N           = 32;  /* × 32 = 393.216 MHz VCO */
+  clk.PLL2.PLL2P           = 4;   /* / 4  = 98.304 MHz → SAI1 */
+  clk.PLL2.PLL2Q           = 4;
+  clk.PLL2.PLL2R           = 4;
+  clk.PLL2.PLL2RGE         = RCC_PLLVCIRANGE_1;  /* 8–16 MHz input range */
+  clk.PLL2.PLL2FRACN       = 0;
+  clk.PLL2.PLL2ClockOut    = RCC_PLL2_DIVP;
+  if (HAL_RCCEx_PeriphCLKConfig(&clk) != HAL_OK)
     Error_Handler();
 }
 
@@ -608,7 +668,7 @@ float GetBatteryVoltage(void)
   HAL_Delay(10);
 
   /* ADC is initialized once at startup — just start/poll/read/stop */
-  HAL_StatusTypeDef start_status = HAL_ADC_Start(&hadc1);
+  HAL_ADC_Start(&hadc1);
   HAL_StatusTypeDef poll_status  = HAL_ADC_PollForConversion(&hadc1, 100);
 
   uint16_t raw = 0;
@@ -637,6 +697,9 @@ float GetBatteryVoltage(void)
    This custom DMA callback checks which node just completed and signals
    the appropriate FreeRTOS event. Toggle flag tracks position in cycle. */
 static volatile uint8_t g_dmaHalfToggle = 0;
+/* Skip the first two DMA signals after each recording start — the buffer fills
+   with silence while the codec PLL locks. Two signals = one full buffer. */
+static volatile uint8_t g_dmaWarmupSkip = 0;
 
 static void DMA_SAI_XferCpltCallback(DMA_HandleTypeDef *hdma)
 {
@@ -678,7 +741,9 @@ static void AudioTransferHalfComplete(SAI_HandleTypeDef *hsai)
 }
 */
 
-/* SAI error callback — captures error codes from ISR, logged from task context */
+/* SAI error callback — captures error codes from ISR, logged from task context.
+   Registered via HAL_SAI_RegisterCallback if SAI error detection is needed. */
+__attribute__((unused))
 static void SAI_ErrorDiag(SAI_HandleTypeDef *hsai)
 {
   g_saiErrorCode = hsai->ErrorCode;
@@ -777,15 +842,10 @@ void HAL_LPTIM_AutoReloadMatchCallback(LPTIM_HandleTypeDef *hlptim)
 {
   if (hlptim->Instance == LPTIM1)
   {
-    /* Long-press: only accept if button still held (PC6 low) */
-    if (HAL_GPIO_ReadPin(PUSHBUTTON_GPIO_Port, PUSHBUTTON_Pin) == GPIO_PIN_RESET)
-    {
-      BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-      xEventGroupSetBitsFromISR(xEventGroup, BUTTON_SIGNAL, &xHigherPriorityTaskWoken);
-      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-    }
-    /* Re-arm one-shot so next button press is detected */
-    HAL_LPTIM_SetOnce_Start_IT(&hlptim1, LPTIM_CHANNEL_1);
+    /* LPTIM1 is used for Stop-2 wakeup only — no action needed here.
+       Do NOT re-arm: one-shot mode is triggered by the RTC/LPTIM wakeup path,
+       not by this callback. Unconditional re-arm caused a 1.75s periodic ISR
+       that corrupted audio DMA timing at 48/96 kHz. */
   }
   else if (hlptim->Instance == LPTIM2)
   {
@@ -963,14 +1023,12 @@ void RecordLoopTask(void const *argument)
 
   for (;;)
   {
-    __HAL_RCC_SDMMC1_CLK_DISABLE();
     uxBits = xEventGroupWaitBits(xEventGroup,
                WRITEBUFFER1_SIGNAL | WRITEBUFFER2_SIGNAL |
                BUTTON_SIGNAL | ALARM_A_SIGNAL | END_OF_DAY_SIGNAL |
                DST_EVENT_SIGNAL | NEW_VOICE_MEMO_SIGNAL |
                LOW_BATTERY_SIGNAL | ERROR_SIGNAL,
                pdTRUE, pdFALSE, pdMS_TO_TICKS(5000));
-    __HAL_RCC_SDMMC1_CLK_ENABLE();
 
     /* Log any deferred SAI/DMA errors captured from ISR context */
     if (g_saiErrorCode || g_dmaErrorCode)
@@ -1013,7 +1071,7 @@ void RecordLoopTask(void const *argument)
       RTC_DeactivateAlarm(RTC_ALARM_B);
       BufferWritesPerFile = WAVFile.FileSize;
 
-      AudioFiles_WriteHeader(&SwiftErrors, &FsFile);
+      AudioFiles_WriteHeader(&SwiftErrors, &FsFile, WAVFile.SampleRate);
       AudioFiles_CloseFile(&SwiftErrors, &FsFile);
 
       osThreadResume(LowBatteryHandle);
@@ -1021,6 +1079,7 @@ void RecordLoopTask(void const *argument)
     }
     else if (uxBits & WRITEBUFFER1_SIGNAL)
     {
+      if (g_dmaWarmupSkip > 0) { g_dmaWarmupSkip--; continue; }
       FatFsResult = f_write(&FsFile, &I2SRxBuffer[0], (UINT)(BUFFER_SIZE_DIV2), (void *)&byteswritten);
       if (FatFsResult != FR_OK)
       {
@@ -1031,6 +1090,7 @@ void RecordLoopTask(void const *argument)
     }
     else if (uxBits & WRITEBUFFER2_SIGNAL)
     {
+      if (g_dmaWarmupSkip > 0) { g_dmaWarmupSkip--; continue; }
       FatFsResult = f_write(&FsFile, &I2SRxBuffer[BUFFER_SIZE_DIV2], (UINT)(BUFFER_SIZE_DIV2), (void *)&byteswritten);
       if (FatFsResult != FR_OK)
       {
@@ -1041,7 +1101,8 @@ void RecordLoopTask(void const *argument)
 
       if (--BufferWritesPerFile == 0)
       {
-        AudioFiles_WriteHeader(&SwiftErrors, &FsFile);
+        WriteSystemLog("<RecordLoop> rotating file");
+        AudioFiles_WriteHeader(&SwiftErrors, &FsFile, WAVFile.SampleRate);
         AudioFiles_CloseFile(&SwiftErrors, &FsFile);
         AudioFiles_NewAudioFile(WAVFile.Filename, DSTSettings.DST_Suffix_To_Use, &FsFile);
         BufferWritesPerFile = WAVFile.FileSize;
@@ -1059,7 +1120,7 @@ void RecordLoopTask(void const *argument)
       RTC_DeactivateAlarm(RTC_ALARM_B);
       BufferWritesPerFile = WAVFile.FileSize;
 
-      AudioFiles_WriteHeader(&SwiftErrors, &FsFile);
+      AudioFiles_WriteHeader(&SwiftErrors, &FsFile, WAVFile.SampleRate);
       AudioFiles_CloseFile(&SwiftErrors, &FsFile);
 
       if (uxBits & BUTTON_SIGNAL)
@@ -1096,7 +1157,7 @@ void RecordLoopTask(void const *argument)
     else if (uxBits & END_OF_DAY_SIGNAL)
     {
       /* Midnight crossing during recording */
-      AudioFiles_WriteHeader(&SwiftErrors, &FsFile);
+      AudioFiles_WriteHeader(&SwiftErrors, &FsFile, WAVFile.SampleRate);
       AudioFiles_CloseFile(&SwiftErrors, &FsFile);
       BufferWritesPerFile = WAVFile.FileSize;
 
@@ -1138,7 +1199,7 @@ void RecordLoopTask(void const *argument)
       HAL_SAI_MspDeInit(&hsai_BlockA1);
       hsai_BlockA1.State = HAL_SAI_STATE_RESET;
 
-      AudioFiles_WriteHeader(&SwiftErrors, &FsFile);
+      AudioFiles_WriteHeader(&SwiftErrors, &FsFile, WAVFile.SampleRate);
       AudioFiles_CloseFile(&SwiftErrors, &FsFile);
       BufferWritesPerFile = WAVFile.FileSize;
 
@@ -1408,14 +1469,7 @@ static void InitializeCodecAndDMA(void)
   if (codecMicBias == 0xFF) codecMicBias = 0x10;  /* default 2.5V if unprogrammed */
 
   HAL_StatusTypeDef codecRet = (HAL_StatusTypeDef)AudioCodec_Initialize(&hi2c1, codecGain, codecMicBias);
-
-  /* Log codec init result — remove once confirmed working */
-  {
-    char dbg[64];
-    snprintf(dbg, sizeof(dbg), "<CODEC> init=%d gain=%u bias=0x%02X\r\n",
-             (int)codecRet, codecGain, codecMicBias);
-    WriteFlashNextEntry(dbg);
-  }
+  (void)codecRet;
 
   /* Step 2: Start SAI DMA — this enables BCLK and FSYNC from the SAI master.
      
@@ -1426,10 +1480,24 @@ static void InitializeCodecAndDMA(void)
      IMPORTANT: We CANNOT use HAL_SAI_Receive_DMA() because it overwrites
      the pre-configured linked-list nodes. Instead we start DMA manually. */
   MX_GPDMA1_Init();
-  MX_SAI1_Init(WAVFile.SampleRate ? WAVFile.SampleRate : 32000);
+  /* Reconfigure PLL2 for the requested sample rate, then init SAI.
+     PLL2 = 98.304 MHz (M=1, N=32, P=4) covers all supported rates exactly.
+     MckOverSampling is set per-rate in MX_SAI1_Init to keep MCKDIV within 6-bit limit. */
+  {
+    uint32_t fs = WAVFile.SampleRate;
+#ifdef FORCE_SAMPLE_RATE
+    fs = FORCE_SAMPLE_RATE;
+#endif
+    if (fs != 8000 && fs != 16000 && fs != 24000 && fs != 32000 && fs != 48000 && fs != 96000 && fs != 192000)
+      fs = 32000;
+    WAVFile.SampleRate = fs;  /* keep WAV header in sync with actual rate */
+    MX_SAI1_ReconfigPLL2(fs);
+    MX_SAI1_Init(fs);
+  }
 
-  /* Reset toggle before starting DMA */
+  /* Reset toggle and warmup skip before starting DMA */
   g_dmaHalfToggle = 0;
+  g_dmaWarmupSkip = 2;  /* discard first 2 signals (1 full buffer of pre-lock silence) */
 
   /* Register custom DMA callback directly — bypasses SAI HAL's internal callbacks
      which don't work correctly with two-node linked-list (no HT interrupt). */
@@ -1451,64 +1519,7 @@ static void InitializeCodecAndDMA(void)
   HAL_Delay(5);
   AudioCodec_PowerUp(&hi2c1, codecMicBias);
   __HAL_RCC_I2C1_CLK_DISABLE();
-
-  /* Log DMA init results — remove once confirmed working */
-  {
-    char dbg[160];
-    snprintf(dbg, sizeof(dbg),
-             "<SAI> dmaRx=%d saiState=%d dmaMode=0x%lX CR1=0x%08lX toggle=%d\r\n",
-             (int)dmaRx,
-             (int)hsai_BlockA1.State,
-             (unsigned long)hdma_sai1_a.Mode,
-             (unsigned long)SAI1_Block_A->CR1,
-             (int)g_dmaHalfToggle);
-    WriteFlashNextEntry(dbg);
-
-    /* DMA channel register dump — diagnose why HT/TC callbacks never fire */
-    snprintf(dbg, sizeof(dbg),
-             "<DMA> CCR=0x%08lX CSR=0x%08lX CTR1=0x%08lX CTR2=0x%08lX CBR1=0x%08lX CSAR=0x%08lX CDAR=0x%08lX CLLR=0x%08lX\r\n",
-             GPDMA1_Channel0->CCR,
-             GPDMA1_Channel0->CSR,
-             GPDMA1_Channel0->CTR1,
-             GPDMA1_Channel0->CTR2,
-             GPDMA1_Channel0->CBR1,
-             GPDMA1_Channel0->CSAR,
-             GPDMA1_Channel0->CDAR,
-             GPDMA1_Channel0->CLLR);
-    WriteFlashNextEntry(dbg);
-
-    /* Node contents — verify nodes are configured correctly (two-node circular) */
-    snprintf(dbg, sizeof(dbg),
-             "<NODE1> [0]=0x%08lX [1]=0x%08lX [2]=0x%08lX [3]=0x%08lX [4]=0x%08lX [5]=0x%08lX addr=0x%08lX\r\n",
-             SAI_DMA_Node1.LinkRegisters[0], SAI_DMA_Node1.LinkRegisters[1],
-             SAI_DMA_Node1.LinkRegisters[2], SAI_DMA_Node1.LinkRegisters[3],
-             SAI_DMA_Node1.LinkRegisters[4], SAI_DMA_Node1.LinkRegisters[5],
-             (unsigned long)&SAI_DMA_Node1);
-    WriteFlashNextEntry(dbg);
-    snprintf(dbg, sizeof(dbg),
-             "<NODE2> [0]=0x%08lX [1]=0x%08lX [2]=0x%08lX [3]=0x%08lX [4]=0x%08lX [5]=0x%08lX addr=0x%08lX\r\n",
-             SAI_DMA_Node2.LinkRegisters[0], SAI_DMA_Node2.LinkRegisters[1],
-             SAI_DMA_Node2.LinkRegisters[2], SAI_DMA_Node2.LinkRegisters[3],
-             SAI_DMA_Node2.LinkRegisters[4], SAI_DMA_Node2.LinkRegisters[5],
-             (unsigned long)&SAI_DMA_Node2);
-    WriteFlashNextEntry(dbg);
-
-    /* SAI FIFO status — check if data is accumulating (FLVL bits in SR) */
-    snprintf(dbg, sizeof(dbg),
-             "<SAI_SR> SR=0x%08lX CR1=0x%08lX CR2=0x%08lX FRCR=0x%08lX SLOTR=0x%08lX\r\n",
-             SAI1_Block_A->SR,
-             SAI1_Block_A->CR1,
-             SAI1_Block_A->CR2,
-             SAI1_Block_A->FRCR,
-             SAI1_Block_A->SLOTR);
-    WriteFlashNextEntry(dbg);
-
-    /* PLL2 clock check — SAI1 source. If 0, PLL2 is not running → no BCLK */
-    uint32_t saiclk = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SAI1);
-    snprintf(dbg, sizeof(dbg), "<CLK> sai1=%lu RCC_CR=0x%08lX CFGR1=0x%08lX\r\n",
-             saiclk, RCC->CR, RCC->CFGR1);
-    WriteFlashNextEntry(dbg);
-  }
+  (void)dmaRx;
 }
 static void WriteSystemLog(const char *inputString)
 {
@@ -1784,8 +1795,19 @@ void NewVoiceMemoTask(void const *argument)
     RTC_AddTimeAndSetAlarmA();
 
     MX_GPDMA1_Init();
-    MX_SAI1_Init(WAVFile.SampleRate ? WAVFile.SampleRate : 32000);
+    {
+      uint32_t fs = WAVFile.SampleRate;
+#ifdef FORCE_SAMPLE_RATE
+      fs = FORCE_SAMPLE_RATE;
+#endif
+      if (fs != 8000 && fs != 16000 && fs != 24000 && fs != 32000 && fs != 48000 && fs != 96000 && fs != 192000)
+        fs = 32000;
+      WAVFile.SampleRate = fs;
+      MX_SAI1_ReconfigPLL2(fs);
+      MX_SAI1_Init(fs);
+    }
     g_dmaHalfToggle = 0;
+    g_dmaWarmupSkip = 2;
     hdma_sai1_a.XferCpltCallback = DMA_SAI_XferCpltCallback;
     HAL_DMAEx_List_Start_IT(&hdma_sai1_a);
     hsai_BlockA1.State = HAL_SAI_STATE_BUSY_RX;
@@ -1818,7 +1840,7 @@ void NewVoiceMemoTask(void const *argument)
         HAL_SAI_MspDeInit(&hsai_BlockA1);
         hsai_BlockA1.State = HAL_SAI_STATE_RESET;
         LoopFlag = 0;
-        AudioFiles_WriteHeader(&SwiftErrors, &VoiceMemoFile);
+        AudioFiles_WriteHeader(&SwiftErrors, &VoiceMemoFile, WAVFile.SampleRate);
       }
     }
 

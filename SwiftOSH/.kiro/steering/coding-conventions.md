@@ -35,6 +35,7 @@ When porting code from the original SwiftOne (STM32L4R9):
 - Replace `stm32l4xx_hal.h` with `stm32u5xx_hal.h`
 - DMA: STM32U5 uses GPDMA (not DMA1/DMA2). Use `GPDMA1_ChannelN` instances. Note: HAL V1.7.0 does NOT have `stm32u5xx_hal_gpdma.h` — it uses `stm32u5xx_hal_dma.h` instead. `HAL_GPDMA_MODULE_ENABLED` must be disabled in `stm32u5xx_hal_conf.h`
 - DMA circular mode: STM32U5 GPDMA does NOT support `DMA_CIRCULAR` as a Mode value. Use `DMA_NORMAL` for `Init.Mode`. Circular transfers require linked-list DMA via `HAL_DMAEx_List_SetCircularMode()` and `HAL_DMAEx_List_Start_IT()` (in `stm32u5xx_hal_dma_ex.c`). The SAI HAL driver checks for linked-list mode internally and calls `HAL_DMAEx_List_Start_IT` — so `stm32u5xx_hal_dma_ex.c` MUST be compiled even if you only use `DMA_NORMAL`
+- **CRITICAL — GPDMA CBR1.BNDT is 16-bit (max 65535 bytes per node).** `DMA_NodeConfTypeDef.DataSize` is in bytes. If `DataSize > 65535` the register silently truncates, causing the DMA to fire far too early and fill the buffer with garbage. `BUFFER_SIZE` in `main.c` and `stm32u5xx_hal_msp.c` must be kept in sync, and `BUFFER_SIZE / 2` must be ≤ 65535. Current value: `BUFFER_SIZE = 131068` (two nodes of 65534 bytes each).
 - Flash: STM32U5 uses `FLASH_TYPEPROGRAM_QUADWORD` (16 bytes) instead of `FLASH_TYPEPROGRAM_DOUBLEWORD` (8 bytes). The HAL_FLASH_Program data parameter is a pointer to the data, not the data value
 - SAI: SwiftOne used SAI2, SwiftOSH uses SAI1 (same block A config)
 - SAI register callbacks: `HAL_SAI_RegisterCallback()` requires `#define USE_HAL_SAI_REGISTER_CALLBACKS 1U` in `stm32u5xx_hal_conf.h`
@@ -58,6 +59,8 @@ When porting code from the original SwiftOne (STM32L4R9):
 - PWR wake-up flags: STM32L4 `PWR_FLAG_WUF1`–`WUF5` become `PWR_WAKEUP_FLAG1`–`FLAG8` on U5. Use `PWR_WAKEUP_ALL_FLAG` to clear all at once. `PWR_FLAG_SB` becomes `PWR_FLAG_SBF`
 - LPTIM: `LPTIM_InitTypeDef.OutputPolarity` removed on U5 — output polarity is now per-channel via `LPTIM_OC_ConfigTypeDef` and `HAL_LPTIM_OC_ConfigChannel()`. `HAL_LPTIM_PWM_Start_IT()` and `HAL_LPTIM_PWM_Stop()` now require a `Channel` parameter (e.g., `LPTIM_CHANNEL_1`). Period is set via `LPTIM_InitTypeDef.Period`, compare via `LPTIM_OC_ConfigTypeDef.Pulse`. `HAL_LPTIM_SetOnce_Start_IT()` takes `(hlptim, Channel)` — not `(hlptim, Period, Compare)` like on L4
 - RTC DST macros: `__HAL_RTC_DAYLIGHT_SAVING_TIME_ADD1H` / `SUB1H` expand to `do{...}while(0);` (with trailing semicolon). Always wrap if/else branches calling these macros in braces `{ }` to avoid dangling-else errors
+- PLL2 reconfiguration: `RCC_OscInitTypeDef.PLL2.PLL2State` does NOT exist in HAL V1.7.0 — to disable PLL2 use `__HAL_RCC_PLL2_DISABLE()` and poll `RCC_FLAG_PLL2RDY` until clear. `HAL_RCCEx_PeriphCLKConfig` hangs if PLL2 is the active clock source for a peripheral when you try to reconfigure it — switch the peripheral to a different clock source first (e.g., `RCC_SAI1CLKSOURCE_HSI`), then disable PLL2, then reconfigure
+- **SAI MCKDIV is a 6-bit field (max value 63).** With PLL2P = 98.304 MHz and `MckOverSampling=ENABLE`, MCKDIV = SAI_clk / (Fs × 1024). At 8kHz this gives 192 — far over 63 — and `HAL_SAI_Init` hits `Error_Handler`. Fix: use `MckOverSampling=DISABLE` for rates ≤ 24kHz (MCKDIV = SAI_clk / (Fs × 512)): 8kHz→24, 16kHz→12, 24kHz→8. Use `MckOverSampling=ENABLE` for ≥ 32kHz: 32kHz→6, 48kHz→4, 96kHz→2, 192kHz→1. Same PLL2 config works for all rates.
 
 ## HAL Configuration Notes (`Core/Inc/stm32u5xx_hal_conf.h`)
 
@@ -91,6 +94,8 @@ When porting code from the original SwiftOne (STM32L4R9):
 - Battery voltage for USB GET_REPORT: use `g_CachedBatteryVoltage` (updated every 10s from the USB main loop)
 - Battery voltage for recording mode: call `GetBatteryVoltage()` from task context only (e.g., `InitializeFATTask` before recording starts)
 - Do NOT call `HAL_LPTIM_SetOnce_Start_IT()` or any HAL init function from within `HAL_LPTIM_AutoReloadMatchCallback` — re-arming LPTIM from its own ISR can cause re-entrancy issues
+- **DMA warmup skip:** After starting SAI DMA, the first two half-buffer signals (`WRITEBUFFER1_SIGNAL` / `WRITEBUFFER2_SIGNAL`) contain silence captured before the codec PLL locks. `g_dmaWarmupSkip = 2` is set in `InitializeCodecAndDMA()` and `NewVoiceMemoTask()`. `RecordLoopTask` decrements and skips writing when `g_dmaWarmupSkip > 0`. Do NOT remove this — without it, every recording starts with one full buffer (~680ms at 96kHz) of silence.
+- **Do NOT do flash writes or other blocking operations after starting SAI DMA** in `InitializeCodecAndDMA`. Any blocking work between `HAL_DMAEx_List_Start_IT` and `osThreadResume(RecordLoopHandle)` delays the task from running and causes it to miss the first DMA signal, doubling the silence gap at the start of recordings.
 
 ## ADC / Battery Voltage Rules (CRITICAL)
 

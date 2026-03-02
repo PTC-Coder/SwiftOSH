@@ -212,7 +212,7 @@ uint8_t AudioFiles_NewConfigTextFile(void)
   return 0;
 }
 
-uint8_t AudioFiles_WriteHeader(SWIFT_ERRORS *SwiftError, FIL *MyFile)
+uint8_t AudioFiles_WriteHeader(SWIFT_ERRORS *SwiftError, FIL *MyFile, uint32_t SampleRate)
 {
   UINT bw;
   FSIZE_t tmpFileEndPointer;
@@ -235,10 +235,8 @@ uint8_t AudioFiles_WriteHeader(SWIFT_ERRORS *SwiftError, FIL *MyFile)
 
   SwiftError->CallingFunction = FUNC_AudioFiles_WriteHeader;
 
-  /* Sample rate from flash (CODEC_SETTINGS_OFFSET+2 = kHz value, same as SwiftSettings reads) */
-  SampleRateWord = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 2) * 1000U;
-  if (SampleRateWord == 0 || SampleRateWord > 96000)
-    SampleRateWord = 32000;
+  /* Use the actual recording sample rate (already validated/clamped by caller) */
+  SampleRateWord = (SampleRate != 0) ? SampleRate : 32000;
 
   /* File size fields */
   WAVFileHeader[4]  = (BYTE)((MyFile->obj.objsize - 8) & 0xFF);

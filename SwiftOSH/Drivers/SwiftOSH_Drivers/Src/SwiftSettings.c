@@ -38,7 +38,15 @@ uint8_t SwiftSettings_GetWAVFileAttributes(WAVFile_Attributes *wav)
   t2 = *(__IO uint8_t *)(addr++);
   t3 = *(__IO uint8_t *)(addr++);
   t4 = *(__IO uint8_t *)(addr++);
-  wav->FileSize = (((t4 << 24) | (t3 << 16) | (t2 << 8) | t1) / 2);
+  {
+    /* FileSize from host = number of 32768-byte buffer writes (SwiftOne buffer size).
+       Scale to our actual half-buffer size (BUFFER_SIZE/2 = 65534 bytes).
+       adjusted = raw * 32768 / 65534, minimum 60 writes (~1 min at any rate). */
+    uint32_t raw = ((t4 << 24) | (t3 << 16) | (t2 << 8) | t1);
+    wav->FileSize = (raw * 32768U) / 65534U;
+    if (wav->FileSize < 60)
+      wav->FileSize = 60;
+  }
 
   wav->FilenameLength = *(__IO uint8_t *)(addr++);
   if (wav->FilenameLength > 20) wav->FilenameLength = 5;  /* Sanity: unprogrammed flash = 0xFF */
@@ -47,8 +55,10 @@ uint8_t SwiftSettings_GetWAVFileAttributes(WAVFile_Attributes *wav)
   wav->Filename[wav->FilenameLength] = 0;
 
   wav->SampleRate = *(__IO uint8_t *)((uint32_t)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 2)) * 1000;
-  if (wav->SampleRate == 0 || wav->SampleRate > 96000)
-    wav->SampleRate = 32000;  /* Default if unprogrammed */
+  if (wav->SampleRate != 8000  && wav->SampleRate != 16000 && wav->SampleRate != 24000 &&
+      wav->SampleRate != 32000 && wav->SampleRate != 48000 && wav->SampleRate != 96000 &&
+      wav->SampleRate != 192000)
+    wav->SampleRate = 32000;  /* Default/clamp for unprogrammed or unsupported rate */
 
   return 1;
 }

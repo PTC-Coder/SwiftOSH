@@ -12,8 +12,10 @@ extern DMA_NodeTypeDef   SAI_DMA_Node1;
 extern DMA_NodeTypeDef   SAI_DMA_Node2;
 extern DMA_QListTypeDef  SAI_DMA_Queue;
 
-/* Buffer size must match main.c */
-#define BUFFER_SIZE       32768
+/* Buffer size must match main.c — keep in sync.
+   CRITICAL: BUFFER_SIZE_DIV2 must be <= 65535 (GPDMA CBR1.BNDT is 16-bit).
+   Using maximum: 65534 bytes per node (even for halfword alignment). */
+#define BUFFER_SIZE       131068
 #define BUFFER_SIZE_DIV2  (BUFFER_SIZE / 2)
 extern uint8_t I2SRxBuffer[];
 

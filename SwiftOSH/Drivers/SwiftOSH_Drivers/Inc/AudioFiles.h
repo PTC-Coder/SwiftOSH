@@ -14,7 +14,7 @@
 #include "SwiftSettings.h"
 
 uint8_t AudioFiles_MountSDCard(SWIFT_ERRORS *SwiftError);
-uint8_t AudioFiles_WriteHeader(SWIFT_ERRORS *SwiftError, FIL *MyFile);
+uint8_t AudioFiles_WriteHeader(SWIFT_ERRORS *SwiftError, FIL *MyFile, uint32_t SampleRate);
 uint8_t AudioFiles_CloseFile(SWIFT_ERRORS *SwiftError, FIL *MyFile);
 
 uint8_t AudioFiles_GetDiskInfoString(char *DiskInfoString);

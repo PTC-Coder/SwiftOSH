@@ -106,14 +106,14 @@ The `.cproject` is configured for STM32CubeIDE v1.17.0+ managed build with:
 ## Key Peripherals and Pin Mapping
 
 - HSE 12.288 MHz crystal → PLL1 ~160 MHz SYSCLK
-- PLL2 → SAI1 audio clock (exact 32/48 kHz sample rates)
+- PLL2 → SAI1 audio clock — reconfigured dynamically at recording start: `PLL2M=1, PLL2N=32, PLL2P=4` → 98.304 MHz, supports 8/16/24/32/48/96/192 kHz with exact integer MCKDIV values. `MckOverSampling` is set per-rate: DISABLE for ≤24kHz (MCKDIV = SAI_clk/512/Fs), ENABLE for ≥32kHz (MCKDIV = SAI_clk/1024/Fs). The SAI MCKDIV field is 6-bit (max 63) — this split keeps all rates within range.
 - HSI48 + CRS (trimmed from LSE) for USB mode
 - LSE 32.768 kHz for RTC and LPTIM1 (Stop-2 wakeup timer)
 - LPTIM2 for LED blink timing — clock source MUST be `RCC_LPTIM2CLKSOURCE_LSE` in `SystemClock_Config()`. With LSE/128 prescaler = 256 Hz counter. `BLINK_PERIOD = 768-1` gives 3s period. Auto-reload interrupt turns LEDs ON; compare match interrupt (after `BLINK_ON_TICKS = 38-1` ≈ 150ms) turns them OFF. Both callbacks live in main.c
 - LPTIM1 for Stop-2 wakeup only — NOT used for button detection
 - Pushbutton: PC6 — plain EXTI falling-edge with internal pull-up (NOT LPTIM1 ETR). ISR sets `BUTTON_PRESS_SIGNAL` (bit 18); `ButtonTask` confirms 1.5s hold then sets `BUTTON_SIGNAL`
 - SAI1: PA8=BCLK, PA9=WCLK, PA10=DOUT, PB8=MCLK
-- I2C1: PB6=SCL, PB7=SDA (codec at 0x4D)
+- I2C1: PB6=SCL, PB7=SDA (codec at 0x4E)
 - SDMMC1: PC8-11=D0-D3, PC12=CLK, PD2=CMD, PC13=card detect
 - USB: PA11=DM, PA12=DP
 - LEDs: RED=PC1 (active-high), GREEN=PA1 (active-high), BLUE=PA2 (active-high)
@@ -124,12 +124,10 @@ The original SwiftOne firmware was used as a reference during porting. The Swift
 
 ## Current State (Bring-Up)
 
-- Board boots and reaches main() — diagnostic LED blink confirmed working
-- Two startup bugs RESOLVED (see "Bring-Up Findings" below):
-  1. Linker script had 272K RAM but only 256K is contiguous → invalid stack pointer → instant fault
-  2. Startup assembly was missing `.data` copy and `.bss` zero-fill → garbage in all globals
-- `main()` is currently a diagnostic LED test — next step is restoring HAL_Init and peripheral init
-- `HAL_InitTick()` is overridden as a no-op in main.c — prevents SysTick from being configured by HAL
+- Board boots, runs FreeRTOS, records audio to SD card at 32kHz — confirmed working (green blink during recording)
+- USB HID enumeration, GET_REPORT, and SET_REPORT all working — SwiftOne Config Utility can read and write all settings
+- Recording mode fully functional: SD mount with retry, Stop 2 sleep/wake, schedule-based recording, WAV files with correct headers
+- `HAL_InitTick()` is overridden as a no-op in main.c — SysTick not used by HAL; TIM6 is the HAL timebase in recording mode
 - `HardFault_Handler` in `stm32u5xx_it.c` blinks RED LED (PC1) via raw register writes — essential for debugging, do NOT revert to `while(1){}`
 - SVC_Handler, PendSV_Handler, SysTick_Handler are provided by the FreeRTOS CM33 port via `#define` mappings in `FreeRTOSConfig.h` — do NOT define them in `stm32u5xx_it.c`
 - The startup assembly (`startup_stm32u545retxq.s`) disables SysTick, clears pending PendSV/SysTick, calls SystemInit, copies `.data`, zeros `.bss`, then calls main
@@ -218,4 +216,6 @@ Current implementation:
 12. ~~USB HID SET_REPORT (write settings to device)~~ DONE — deferred flash queue, 16-byte aligned offsets, verified working
 13. ~~Fix LED blink period (LPTIM2 clock source)~~ DONE — 3s period at LSE/128 = 256 Hz
 14. ~~Pushbutton long-press detection~~ DONE — EXTI + ButtonTask, 1.5s hold, solid blue feedback
-15. Port SD firmware update (SD_FW_Update) from SwiftOne
+15. ~~Translate USB HID codec settings to TLV320ADC3120 register format~~ DONE — gain (0.5dB steps, clamped to 84), mic bias (0x10→2.5V, 0x18→3.3V), sample rate auto-detected by codec
+16. ~~Fix sample rate support~~ DONE — all rates (8/16/24/32/48/96/192 kHz) working. PLL2 reconfigured dynamically via `MX_SAI1_ReconfigPLL2(fs)` using a 3-step sequence: (1) switch SAI1 to HSI16, (2) disable PLL2 via `__HAL_RCC_PLL2_DISABLE()` + poll `RCC_FLAG_PLL2RDY`, (3) reconfigure PLL2 M=1/N=32/P=4 → 98.304 MHz and switch SAI1 back. `MckOverSampling` is DISABLE for ≤24kHz and ENABLE for ≥32kHz — the SAI MCKDIV register is 6-bit (max 63); without this split, 8/16/24kHz would require MCKDIV > 63 and HAL_SAI_Init hits Error_Handler. `BUFFER_SIZE = 131068` bytes (two nodes of 65534 bytes each — the GPDMA CBR1.BNDT 16-bit max). `FORCE_SAMPLE_RATE` define in `main.c` allows compile-time rate override for testing. `g_dmaWarmupSkip = 2` discards the first two DMA signals after each recording start to eliminate the pre-lock silence gap.
+17. Port SD firmware update (SD_FW_Update) from SwiftOne

@@ -22,19 +22,24 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - `g_LastWriteStatus`, `g_LastEraseStatus`, `g_LastFlashError` — debug globals for checking flash operation results
 
 ### AudioCodec (AudioCodec.h / AudioCodec.c)
-- `AudioCodec_Initialize(hi2c, gain)` — configures TLV320ADC3120 via I2C
-  - `gain`: digital gain for CH1_CFG2, 0.5dB/step (0x00=0dB, 0x28=20dB, 0x38=28dB)
-  - Gain read from flash at `CODEC_SETTINGS_OFFSET + 3`, default 0x38 if unprogrammed
-- `AudioCodec_PowerUp(hi2c)` — powers up ADC, MICBIAS, PLL. **MUST be called AFTER SAI DMA starts** — codec PLL needs BCLK/FSYNC present to lock
-- `AudioCodec_SleepMode(hi2c)` — powers down ADC for low-power
-- `AudioCodec_WakeFromSleep(hi2c)` — re-enables ADC
+- `AudioCodec_Initialize(hi2c, gain, mic_bias_cfg)` — configures TLV320ADC3120 via I2C. Does NOT power up ADC — call `AudioCodec_PowerUp()` after SAI DMA starts
+  - `gain`: host gain byte, 0.5dB/step (0–95). Clamped to 84 (42dB max) internally. Register value = `gain << 1` into CH1_CFG1 bits[7:1]
+  - `mic_bias_cfg`: host mic bias byte — `0x00`=off, `0x10`=2.5V (default), `0x18`=3.3V
+  - Gain read from flash at `CODEC_SETTINGS_OFFSET + 3`, default 66 (33dB) if unprogrammed (0xFF)
+  - Mic bias read from flash at `CODEC_SETTINGS_OFFSET + 13`, default 0x10 (2.5V) if unprogrammed
+- `AudioCodec_PowerUp(hi2c, mic_bias_cfg)` — powers up ADC, PLL, and optionally MICBIAS. **MUST be called AFTER SAI DMA starts** — codec PLL auto-detects BCLK/FSYNC to lock; clocks must be present
+- `AudioCodec_SleepMode(hi2c)` — puts codec into sleep mode (<10µA). Wait ≥6ms before stopping BCLK
+- `AudioCodec_WakeFromSleep(hi2c, mic_bias_cfg)` — wakes codec and re-enables channel 1 and power. BCLK/FSYNC must already be running
 - Codec I2C address: **0x4E (7-bit)**, shifted to 0x9C for HAL (ADDR pin tied high on SwiftOSH)
-- Key register configuration:
-  - `REG_SLEEP_CFG (0x02)`: Wake from sleep, enable AREG
-  - `REG_ASI_CFG0 (0x07)`: I2S format, 16-bit word length (0x30)
-  - `REG_CH1_CFG0 (0x3C)`: Single-ended input (0x20)
-  - `REG_BIAS_CFG (0x3B)`: MICBIAS voltage and ADC full-scale (default 0x00 = 2.75V)
-  - `REG_PWR_CFG (0x75)`: ADC power-up, MICBIAS enable, PLL enable
+- Key register configuration (TLV320ADC3120, NOT TLV320AIC3120 — completely different register map):
+  - `REG_SLEEP_CFG (0x02)`: `0x81` = wake, internal AREG (required for AVDD=3.3V); `0x00` = sleep
+  - `REG_ASI_CFG0 (0x07)`: `0x40` = I2S format, 16-bit word length (default is TDM `0x30` — must change)
+  - `REG_BIAS_CFG (0x3B)`: MICBIAS — `0x01`=2.5V, `0x60`=3.3V (AVDD), `0x00`=off
+  - `REG_CH1_CFG0 (0x3C)`: `0x20` = single-ended input IN1P/IN1M
+  - `REG_CH1_CFG1 (0x3D)`: analog gain bits[7:1] — value = `gain << 1`, max 84 (42dB)
+  - `REG_IN_CH_EN (0x73)`: `0x80` = enable input channel 1 only
+  - `REG_ASI_OUT_CH_EN (0x74)`: `0x80` = enable ASI output channel 1 only
+  - `REG_PWR_CFG (0x75)`: `0xA0` = ADC+PLL (no MICBIAS); `0xE0` = ADC+MICBIAS+PLL
 
 ### RTC_Swift (RTC_Swift.h / RTC_Swift.c)
 - `RTC_SetDateTime(buffer)` — sets RTC date/time from USB HID buffer (BCD format)
@@ -70,7 +75,7 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - `AudioFiles_NewRecordingDirectory(WAVFile)` — creates numbered recording directory (e.g., PREFIX000)
 - `AudioFiles_NewDayDirectory(label)` — creates date-stamped subdirectory (e.g., PREFIX2026-02-11)
 - `AudioFiles_NewAudioFile(label, suffix, file)` — creates timestamped WAV file, seeks past 46-byte header
-- `AudioFiles_WriteHeader(SwiftError, file)` — writes WAV header with correct file size and sample rate
+- `AudioFiles_WriteHeader(SwiftError, file, SampleRate)` — writes WAV header with correct file size, sample rate, and byte rate. `SampleRate` is passed explicitly (Hz) — do NOT rely on flash; always pass `WAVFile.SampleRate` which has already been validated/clamped by the caller
 - `AudioFiles_CloseFile(SwiftError, file)` — truncates and closes file
 - `AudioFiles_GetDiskInfoString(str)` — returns formatted disk space info
 - `AudioFiles_NewConfigTextFile()` — writes SwiftConfig.txt with settings from flash
@@ -161,8 +166,43 @@ STM32U5 GPDMA does NOT support the `DMA_CIRCULAR` mode or half-transfer interrup
 
 **WARNING**: Do NOT use `HAL_SAI_Receive_DMA()` — it overwrites the two-node linked-list configuration with its own single-node setup.
 
-### Sample Rate Flash Settings Issue
-The TLV320ADC3120 uses different sample rate encoding than the old SwiftOne codec. The flash settings byte at `CODEC_SETTINGS_OFFSET + 2` contains old codec values. Currently forcing 32kHz in `SwiftSettings_GetWAVFileAttributes()` and `AudioFiles_WriteHeader()` until a translator is implemented.
+### Sample Rate Constraints
+PLL2 is reconfigured dynamically at recording start via `MX_SAI1_ReconfigPLL2(fs)` before `MX_SAI1_Init()`. A single PLL2 config covers all supported rates (HSE = 12.288 MHz):
+
+- `PLL2M=1, PLL2N=32, PLL2P=4` → VCO = 393.216 MHz, PLL2P output = **98.304 MHz**
+- BCLK = 64 × Fs. MCKDIV = 98304000 / (Fs × 64):
+  - 8kHz → MCKDIV=192 ✓, 16kHz → MCKDIV=96 ✓, 24kHz → MCKDIV=64 ✓
+  - 32kHz → MCKDIV=48 ✓, 48kHz → MCKDIV=32 ✓, 96kHz → MCKDIV=16 ✓, 192kHz → MCKDIV=8 ✓
+
+The TLV320ADC3120 supports up to 384kHz (Table 8-6). Max supported rate is **192kHz** (MCKDIV=8).
+
+`BUFFER_SIZE = 192000` bytes (188 KB) — sized for ≥500 ms SD write window at 96 kHz, and 250 ms at 192 kHz. Both are well above SD worst-case write latency.
+
+Any unsupported rate falls back to 32kHz. `WAVFile.SampleRate` is updated to the validated rate before `MX_SAI1_Init()` so `AudioFiles_WriteHeader()` writes the correct rate into the WAV header.
+
+**Both `InitializeCodecAndDMA()` and `NewVoiceMemoTask()` use this pattern:**
+```c
+uint32_t fs = WAVFile.SampleRate;
+#ifdef FORCE_SAMPLE_RATE
+fs = FORCE_SAMPLE_RATE;
+#endif
+if (fs != 8000 && fs != 16000 && fs != 24000 && fs != 32000 && fs != 48000 && fs != 96000 && fs != 192000)
+  fs = 32000;
+WAVFile.SampleRate = fs;
+MX_SAI1_ReconfigPLL2(fs);
+MX_SAI1_Init(fs);
+```
+
+**`MX_SAI1_ReconfigPLL2` — CRITICAL: 3-step sequence required**
+
+`HAL_RCCEx_PeriphCLKConfig` cannot reconfigure PLL2 while it is the active SAI1 clock source — it hangs waiting for `PLL2RDY` to clear. The function uses this sequence:
+1. Switch SAI1 clock source to HSI16 (`RCC_SAI1CLKSOURCE_HSI`) — frees PLL2
+2. Disable PLL2 via `__HAL_RCC_PLL2_DISABLE()` + poll `RCC_FLAG_PLL2RDY` until clear (HAL V1.7.0 has no `PLL2State` field — `RCC_OscInitTypeDef.PLL2.PLL2State` does not exist)
+3. Reconfigure PLL2 (M=1, N=32, P=4) and switch SAI1 back to PLL2 via `HAL_RCCEx_PeriphCLKConfig` — this handles enabling PLL2 and waiting for lock internally
+
+`SystemClock_Config` does NOT configure PLL2 at all — PLL2 boots off. `MX_SAI1_ReconfigPLL2` is the sole owner of PLL2 and always starts it fresh from the off state.
+
+**`FORCE_SAMPLE_RATE` compile-time override** — defined (commented out) near the top of `main.c`. Uncomment and set to any supported rate to override flash settings without using the config UI. Useful for testing rates the host app doesn't yet offer.
 
 ## Adding New Drivers
 

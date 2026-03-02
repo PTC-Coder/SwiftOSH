@@ -162,58 +162,64 @@ static int8_t CUSTOM_HID_OutEvent_FS(uint8_t *Buffer)
 }
 
 /**
-  * @brief  Process deferred flash operations. Call from main loop.
-  *         Handles one pending report per call — call repeatedly until done.
+  * @brief  Process ALL pending deferred flash operations. Call from main loop.
+  *         Drains the entire queue in one call so read-back after write always
+  *         sees the committed data — the host reads back immediately after sending
+  *         all OUT reports, so we must finish all writes before returning.
   */
 void USB_HID_ProcessFlash(void)
 {
-  if (g_QueueHead == g_QueueTail)
-    return;  /* queue empty */
-
-  FlashQueueEntry_t *entry = &g_FlashQueue[g_QueueHead];
-  uint8_t reportId = entry->reportId;
-  g_QueueHead = (g_QueueHead + 1) % FLASH_QUEUE_DEPTH;
-
-  /* Flash stores the full report buffer as-is: [reportID][arraySize][data...]
-     GET_REPORT reads it back verbatim so the host read-back verification passes.
-     SwiftSettings readers skip byte 0 (reportID) and byte 1 (arraySize) with +2/+3 offsets. */
-  switch (reportId)
+  /* Drain the entire queue in one call.
+     EraseFlashSector() (triggered by report 2) wipes the whole settings page.
+     All subsequent report writes must complete before the host reads back —
+     the host sends all OUT reports then immediately issues GET_REPORT for each.
+     Processing one-per-call left the other blocks as 0xFF at read-back time. */
+  while (g_QueueHead != g_QueueTail)
   {
-    case 2:  /* Codec Settings — erase entire page first, then write */
-      EraseFlashSector();
-      WriteToFlash(entry->data, CODEC_SETTINGS_OFFSET, 3);
-      break;
+    FlashQueueEntry_t *entry = &g_FlashQueue[g_QueueHead];
+    uint8_t reportId = entry->reportId;
+    g_QueueHead = (g_QueueHead + 1) % FLASH_QUEUE_DEPTH;
 
-    case 12: /* Clock Dividers */
-      WriteToFlash(entry->data, STM32_CLOCKDIV_OFFSET, 3);
-      break;
+    /* Flash stores the full report buffer as-is: [reportID][arraySize][data...]
+       GET_REPORT reads it back verbatim so the host read-back verification passes. */
+    switch (reportId)
+    {
+      case 2:  /* Codec Settings — erase entire page first, then write */
+        EraseFlashSector();
+        WriteToFlash(entry->data, CODEC_SETTINGS_OFFSET, 3);
+        break;
 
-    case 14: /* WAV File Attributes */
-      WriteToFlash(entry->data, WAVFILE_ATTRIBUTES_OFFSET, 3);
-      break;
+      case 12: /* Clock Dividers */
+        WriteToFlash(entry->data, STM32_CLOCKDIV_OFFSET, 3);
+        break;
 
-    case 16: /* Schedule Start Times */
-      WriteToFlash(entry->data, SCHEDULE_STARTTIMES_OFFSET, 6);
-      break;
+      case 14: /* WAV File Attributes */
+        WriteToFlash(entry->data, WAVFILE_ATTRIBUTES_OFFSET, 3);
+        break;
 
-    case 18: /* Schedule Stop Times */
-      WriteToFlash(entry->data, SCHEDULE_STOPTIMES_OFFSET, 6);
-      break;
+      case 16: /* Schedule Start Times */
+        WriteToFlash(entry->data, SCHEDULE_STARTTIMES_OFFSET, 6);
+        break;
 
-    case 19: /* Config Text File — byte[1] is packet number */
-      WriteToFlash(entry->data, CONFIG_TEXTFILE_OFFSET + (entry->data[1] * 48), 6);
-      break;
+      case 18: /* Schedule Stop Times */
+        WriteToFlash(entry->data, SCHEDULE_STOPTIMES_OFFSET, 6);
+        break;
 
-    case 22: /* Lat/Long */
-      WriteToFlash(entry->data, LATLONG_OFFSET, 6);
-      break;
+      case 19: /* Config Text File — byte[1] is packet number */
+        WriteToFlash(entry->data, CONFIG_TEXTFILE_OFFSET + (entry->data[1] * 48), 6);
+        break;
 
-    case 24: /* DST Settings — byte[30] is DST status flag */
-      RTC_SetDSTActiveFlag(entry->data[30]);
-      WriteToFlash(entry->data, DST_OFFSET, 4);
-      break;
+      case 22: /* Lat/Long */
+        WriteToFlash(entry->data, LATLONG_OFFSET, 6);
+        break;
 
-    default:
-      break;
+      case 24: /* DST Settings — byte[30] is DST status flag */
+        RTC_SetDSTActiveFlag(entry->data[30]);
+        WriteToFlash(entry->data, DST_OFFSET, 4);
+        break;
+
+      default:
+        break;
+    }
   }
 }
