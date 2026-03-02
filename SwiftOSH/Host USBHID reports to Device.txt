@@ -1,0 +1,176 @@
+=== SAVE CHANGES TO SWIFT — USB HID OUTPUT REPORTS ===
+
+--- OUTPUT REPORT 1: CODEC Settings ---
+Report ID: 2
+Array Size: 24 bytes (byte[1] = 24)
+Byte[0]  = Report ID (overwritten to 2 by USB send)
+Byte[1]  = 24 (array size)
+Byte[2]  = Sample Rate (8, 12, 16, 24, 32, 48, or 96)
+Byte[3]  = Analog Gain
+Byte[4]  = PLL PR
+Byte[5]  = PLL J
+Byte[6]  = PLL D MSB
+Byte[7]  = PLL D LSB
+Byte[8]  = NADC
+Byte[9]  = MADC
+Byte[10] = AOSR
+Byte[11] = BDIV
+Byte[12] = PRB
+Byte[13] = Mic Bias Voltage
+Byte[14] = 0xFF (reserved)
+Byte[15] = 0xFF (reserved)
+Byte[16] = 0xFF (reserved)
+Byte[17] = 0xFF (reserved)
+Byte[18] = 0xFF (doubleword pad)
+Byte[19] = 0xFF (doubleword pad)
+Byte[20] = 0xFF (doubleword pad)
+Byte[21] = 0xFF (doubleword pad)
+Byte[22] = 0xFF (doubleword pad)
+Byte[23] = 0xFF (doubleword pad)
+
+--- OUTPUT REPORT 2: STM32 Clock Dividers ---
+Report ID: 12
+Array Size: 24 bytes (byte[1] = 0, not explicitly set by encoder)
+Byte[0]  = Report ID (overwritten to 12 by USB send)
+Byte[1]  = 0 (not set by encoder)
+Byte[2]  = HSE M Divider (PLLM1)
+Byte[3]  = PLL N Multiplier MSB
+Byte[4]  = PLL N Multiplier LSB (PLLN)
+Byte[5]  = PLL Q Divider (0xFF)
+Byte[6]  = PLL P Divider (PLLP)
+Byte[7]  = AHB Prescaler
+Byte[8]  = APB1 Prescaler (0xFF)
+Byte[9]  = APB2 Prescaler (0xFF)
+Byte[10] = Flash Latency
+Byte[11] = PLLI2S N Multiplier MSB
+Byte[12] = PLLI2S N Multiplier LSB
+Byte[13] = PLLI2S R Divider
+Byte[14] = MCU I2S Sample Rate
+Byte[15] = 0xFF (reserved)
+Byte[16] = 0xFF (reserved)
+Byte[17] = 0xFF (reserved)
+Byte[18] = 0xFF (reserved)
+Byte[19] = 0xFF (doubleword pad)
+Byte[20] = 0xFF (doubleword pad)
+Byte[21] = 0xFF (doubleword pad)
+Byte[22] = 0xFF (doubleword pad)
+Byte[23] = 0xFF (doubleword pad)
+
+--- OUTPUT REPORT 3: Audio File Settings ---
+Report ID: 14
+Array Size: 24 bytes (byte[1] = 24)
+Byte[0]  = Report ID (overwritten to 14 by USB send)
+Byte[1]  = 24 (array size)
+Byte[2]  = File Size Byte 1 (LSB, in units of 32768-byte buffer writes)
+Byte[3]  = File Size Byte 2
+Byte[4]  = File Size Byte 3
+Byte[5]  = File Size Byte 4 (MSB)
+Byte[6]  = Filename prefix length (number of ASCII chars)
+Byte[7]  = Filename char 1
+Byte[8]  = Filename char 2
+Byte[9]  = Filename char 3
+Byte[10] = Filename char 4
+Byte[11] = Filename char 5
+Byte[12] = Filename char 6
+Byte[13] = Filename char 7
+Byte[14] = Filename char 8
+Byte[15] = Filename char 9
+Byte[16] = Filename char 10
+Byte[17] = 0xFF (reserved)
+Byte[18] = 0xFF (reserved)
+Byte[19] = 0xFF (reserved)
+Byte[20] = 0xFF (reserved)
+Byte[21] = Time Type Byte 1
+Byte[22] = Time Type Byte 2
+Byte[23] = Time Type Byte 3
+
+--- OUTPUT REPORT 4: Schedule Start Times ---
+Report ID: 16
+Array Size: 48 bytes (byte[1] = 48)
+Byte[0]  = Report ID (overwritten to 16 by USB send)
+Byte[1]  = 48 (array size)
+Byte[2]  = Start Year (BCD)
+Byte[3]  = Start Month (BCD)
+Byte[4]  = Start Day of Month (BCD)
+Byte[5]  = Schedule Info Byte (upper nibble = schedule type, lower bits = midnight flags)
+             Schedule Type: 1=Arbitrary, 2=DutyCycled, 3=Continuous
+             Bit 0 = starts at midnight flag
+             Bit 1 = ends at midnight flag
+Byte[6]  = Number of entries
+Byte[7]  = Start Time 1 Hour (binary)
+Byte[8]  = Start Time 1 Minute (binary)
+Byte[9]  = Start Time 2 Hour
+Byte[10] = Start Time 2 Minute
+... (repeats for up to 20 entries)
+Byte[45] = Start Time 20 Hour
+Byte[46] = Start Time 20 Minute
+Byte[47] = 0xFF (doubleword pad)
+
+--- OUTPUT REPORT 5: Schedule Stop Times ---
+Report ID: 18
+Array Size: 48 bytes (byte[1] = 48)
+Byte[0]  = Report ID (overwritten to 18 by USB send)
+Byte[1]  = 48 (array size)
+Byte[2]  = Stop Year (BCD)
+Byte[3]  = Stop Month (BCD)
+Byte[4]  = Stop Day of Month (BCD)
+Byte[5]  = Schedule Info Byte (same format as start times)
+Byte[6]  = Number of entries
+Byte[7]  = Stop Time 1 Hour (binary)
+Byte[8]  = Stop Time 1 Minute (binary)
+... (repeats for up to 20 entries)
+Byte[45] = Stop Time 20 Hour
+Byte[46] = Stop Time 20 Minute
+Byte[47] = 0xFF (doubleword pad)
+
+--- OUTPUT REPORT 6: Location ---
+Report ID: 22
+Array Size: 48 bytes (byte[1] = 48)
+Byte[0]  = Report ID (22, set by encoder)
+Byte[1]  = 48 (array size)
+Byte[2-47] = UTF-8 DMS string, zero-padded to 46 bytes
+             Format: "42?28'34.13"N_76?26'54.11"W_"
+             (? = 0x3F used in place of degree symbol)
+
+--- OUTPUT REPORT 7: DST Settings ---
+Report ID: 24
+Array Size: 32 bytes (byte[1] = 32)
+Byte[0]  = 24 (report ID)
+Byte[1]  = 32 (array size)
+Byte[2]  = DST Start Day of Year LSB (uint16 LE)
+Byte[3]  = DST Start Day of Year MSB
+Byte[4]  = DST End Day of Year LSB (uint16 LE)
+Byte[5]  = DST End Day of Year MSB
+Byte[6]  = DST Hour Offset
+Byte[7]  = DST Minute Offset
+Byte[8-18]  = Suffix 1 (11 bytes UTF-8, e.g. "_-05:00\0\0\0\0")
+Byte[19-29] = Suffix 2 (11 bytes UTF-8, e.g. "_-04:00\0\0\0\0")
+Byte[30] = DST Status Flag
+             0 = DST disabled
+             1 = DST enabled, not currently active
+             2 = DST enabled and currently active
+             3 = DST enabled but no offset rule observed
+Byte[31] = Offset Sign (UTF-8 byte: '+' = 0x2B or '-' = 0x2D)
+
+--- OUTPUT REPORT 8: Configuration Text (multi-packet) ---
+Report ID: 19
+Packet Size: 47 bytes each
+Byte[0]  = Report ID (19)
+Byte[1]  = Packet number (0-based)
+Byte[2]  = Total number of packets (0-based, i.e. count - 1)
+Byte[3]  = Number of valid data bytes in this packet
+Byte[4-46] = UTF-8 text data (43 bytes per packet, last packet null-padded)
+Content: Human-readable SwiftConfig.txt for SD card
+
+=== READ-BACK VERIFICATION ===
+After sending all output reports, the PC reads back each setting
+using the corresponding INPUT report IDs and compares:
+  Input ID 1  <- CODEC (24 bytes)
+  Input ID 11 <- STM32 Clock (24 bytes)
+  Input ID 13 <- Audio File (24 bytes)
+  Input ID 15 <- Schedule Start Times (48 bytes)
+  Input ID 17 <- Schedule Stop Times (48 bytes)
+  Input ID 21 <- Location (48 bytes)
+  Input ID 23 <- DST Settings (32 bytes)
+Read-back is done twice. If first read doesn't match sent data,
+second read is compared. Error shown per block if both fail.

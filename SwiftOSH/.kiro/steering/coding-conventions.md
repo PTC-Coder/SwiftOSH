@@ -61,6 +61,7 @@ When porting code from the original SwiftOne (STM32L4R9):
 - RTC DST macros: `__HAL_RTC_DAYLIGHT_SAVING_TIME_ADD1H` / `SUB1H` expand to `do{...}while(0);` (with trailing semicolon). Always wrap if/else branches calling these macros in braces `{ }` to avoid dangling-else errors
 - PLL2 reconfiguration: `RCC_OscInitTypeDef.PLL2.PLL2State` does NOT exist in HAL V1.7.0 — to disable PLL2 use `__HAL_RCC_PLL2_DISABLE()` and poll `RCC_FLAG_PLL2RDY` until clear. `HAL_RCCEx_PeriphCLKConfig` hangs if PLL2 is the active clock source for a peripheral when you try to reconfigure it — switch the peripheral to a different clock source first (e.g., `RCC_SAI1CLKSOURCE_HSI`), then disable PLL2, then reconfigure
 - **SAI MCKDIV is a 6-bit field (max value 63).** With PLL2P = 98.304 MHz and `MckOverSampling=ENABLE`, MCKDIV = SAI_clk / (Fs × 1024). At 8kHz this gives 192 — far over 63 — and `HAL_SAI_Init` hits `Error_Handler`. Fix: use `MckOverSampling=DISABLE` for rates ≤ 24kHz (MCKDIV = SAI_clk / (Fs × 512)): 8kHz→24, 16kHz→12, 24kHz→8. Use `MckOverSampling=ENABLE` for ≥ 32kHz: 32kHz→6, 48kHz→4, 96kHz→2, 192kHz→1. Same PLL2 config works for all rates.
+- **12kHz is NOT in `IS_SAI_AUDIO_FREQUENCY`** — passing it as `AudioFrequency` triggers `assert_param` → `Error_Handler`. Use `SAI_AUDIO_FREQUENCY_MCKDIV` with `Mckdiv=32` instead (98304000 / (12000 × 256) = 32, OSR=DISABLE). **CRITICAL: do NOT set `Mckdiv=0` explicitly for other rates and do NOT set `hsai_BlockA1.State = HAL_SAI_STATE_RESET` before `HAL_SAI_Init` — both silently break working rates.**
 
 ## HAL Configuration Notes (`Core/Inc/stm32u5xx_hal_conf.h`)
 
@@ -249,6 +250,30 @@ STM32U5 has a completely different peripheral memory map from STM32L4/F4. Do NOT
 - If a board has been previously programmed or option bytes modified, `NSBOOTADD0` may point elsewhere — verify in STM32CubeProgrammer Option Bytes tab
 - `TZEN` must be `0` (TrustZone disabled) — if enabled, the MCU boots to a secure address and ignores non-secure flash code
 - Programming is done via USB DFU (BOOT0 mode) using STM32CubeProgrammer with the hex file from `Debug/SwiftOSH.hex`
+
+## SD Mount Retry Pattern
+
+When SD mount fails in `InitializeFATTask`, use `RTC_BKP_DR2` as a persistent reboot counter:
+
+```c
+uint32_t retryCount = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
+retryCount++;
+HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, retryCount);
+// log attempt N/15
+if (retryCount >= 15) {
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, 0);
+    // signal ERROR, blink red, terminate
+}
+uint32_t delayMs = retryCount * 2000;
+if (delayMs > 30000) delayMs = 30000;
+osDelay(delayMs);
+NVIC_SystemReset();
+```
+
+- `RTC_BKP_DR2` survives `NVIC_SystemReset()` — it's in the RTC backup domain
+- Clear it to 0 on successful mount (early in `InitializeFATTask` after `AudioFiles_MountSDCard` succeeds)
+- Backoff gives slow/cold SD cards time to initialize — rapid rebooting was masking card timing issues
+- 15-attempt cap prevents infinite reboot loops when the card is genuinely absent or broken
 
 ## What Still Needs Porting
 

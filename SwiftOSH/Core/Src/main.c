@@ -940,14 +940,38 @@ void InitializeFATTask(void const *argument)
   LowBatteryHandle = osThreadCreate(osThread(LowBattery), NULL);
   osThreadSuspend(LowBatteryHandle);
 
-  /* Init SDMMC and mount FatFS */
+  /* Init SDMMC and mount FatFS.
+     Use RTC_BKP_DR2 as a persistent retry counter across reboots.
+     Each failed mount increments the counter and delays before rebooting,
+     giving the SD card time to settle (slow cards, cold boot, Stop 2 wake).
+     After 15 attempts, stop rebooting and blink red permanently. */
   MX_SDMMC1_SD_Init();
   if (AudioFiles_MountSDCard(&SwiftErrors) != 0)
   {
-    WriteSystemLog("<FAT Task> Error mounting SD Card.");
-    osThreadResume(ErrorHandle);
-    xEventGroupSetBits(xEventGroup, ERROR_SIGNAL);
-    osThreadTerminate(NULL);
+    uint32_t retryCount = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
+    retryCount++;
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, retryCount);
+
+    char dbg[48];
+    snprintf(dbg, sizeof(dbg), "<FAT Task> SD mount fail, attempt %lu/15", (unsigned long)retryCount);
+    WriteSystemLog(dbg);
+
+    if (retryCount >= 15)
+    {
+      /* Too many failures — stop rebooting, blink red permanently */
+      WriteSystemLog("<FAT Task> SD mount failed 15 times, giving up.");
+      HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, 0);  /* reset for next power cycle */
+      osThreadResume(ErrorHandle);
+      xEventGroupSetBits(xEventGroup, ERROR_SIGNAL);
+      osThreadTerminate(NULL);
+    }
+
+    /* Backoff delay: 2s × attempt number (2s, 4s, 6s … up to 30s max) */
+    uint32_t delayMs = retryCount * 2000;
+    if (delayMs > 30000) delayMs = 30000;
+    osDelay(delayMs);
+
+    NVIC_SystemReset();
   }
   WriteSystemLog("<FAT Task> SD Card mounted.");
 
@@ -1488,7 +1512,7 @@ static void InitializeCodecAndDMA(void)
 #ifdef FORCE_SAMPLE_RATE
     fs = FORCE_SAMPLE_RATE;
 #endif
-    if (fs != 8000 && fs != 16000 && fs != 24000 && fs != 32000 && fs != 48000 && fs != 96000 && fs != 192000)
+    if (fs != 8000 && fs != 12000 && fs != 16000 && fs != 24000 && fs != 32000 && fs != 48000 && fs != 96000 && fs != 192000)
       fs = 32000;
     WAVFile.SampleRate = fs;  /* keep WAV header in sync with actual rate */
     MX_SAI1_ReconfigPLL2(fs);
@@ -1800,7 +1824,7 @@ void NewVoiceMemoTask(void const *argument)
 #ifdef FORCE_SAMPLE_RATE
       fs = FORCE_SAMPLE_RATE;
 #endif
-      if (fs != 8000 && fs != 16000 && fs != 24000 && fs != 32000 && fs != 48000 && fs != 96000 && fs != 192000)
+      if (fs != 8000 && fs != 12000 && fs != 16000 && fs != 24000 && fs != 32000 && fs != 48000 && fs != 96000 && fs != 192000)
         fs = 32000;
       WAVFile.SampleRate = fs;
       MX_SAI1_ReconfigPLL2(fs);

@@ -1,0 +1,86 @@
+=== READ-BACK VERIFICATION — WHAT THE SOFTWARE EXPECTS FROM FW ===
+
+After sending all 7 output reports, the software reads back each
+setting TWICE using input reports. It compares the SENT data against
+the RECEIVED data byte-for-byte.
+
+CRITICAL: Byte[0] is zeroed out on BOTH the sent and received arrays
+before comparison. So the FW can return any value in byte[0] (typically
+the input report ID) — it gets ignored during comparison.
+
+All other bytes (byte[1] through end) must match exactly.
+
+--- INPUT REPORT ID 1: CODEC Settings ---
+Buffer size: 24 bytes
+Compared against: CODEC output (report ID 2) with byte[0] = 0
+Expected byte[1] = 24 (array size, as set by CODEC encoder)
+Expected byte[2..23] = exact same payload that was sent
+
+--- INPUT REPORT ID 11: STM32 Clock Settings ---
+Buffer size: 24 bytes
+Compared against: STM32 output (report ID 12) with byte[0] = 0
+NOTE: The STM32 encoder never sets byte[1], so it's 0x00 in the
+SENT array. The FW must also return 0x00 in byte[1] to match,
+OR both will be 0 and it passes anyway.
+Expected byte[2..23] = exact same payload that was sent
+
+--- INPUT REPORT ID 13: Audio File Settings ---
+Buffer size: 24 bytes
+Compared against: File output (report ID 14) with byte[0] = 0
+Expected byte[1] = 24 (array size)
+Expected byte[2..23] = exact same payload that was sent
+
+--- INPUT REPORT ID 15: Schedule Start Times ---
+Buffer size: 48 bytes
+Compared against: Start Times output (report ID 16) with byte[0] = 0
+Expected byte[1] = 48 (array size)
+Expected byte[2..47] = exact same payload that was sent
+(unused time slots filled with 0xFF)
+
+--- INPUT REPORT ID 17: Schedule Stop Times ---
+Buffer size: 48 bytes
+Compared against: Stop Times output (report ID 18) with byte[0] = 0
+Expected byte[1] = 48 (array size)
+Expected byte[2..47] = exact same payload that was sent
+(unused time slots filled with 0xFF)
+
+--- INPUT REPORT ID 21: Location ---
+Buffer size: 48 bytes
+Compared against: Location output (report ID 22) with byte[0] = 0
+Expected byte[1] = 48 (array size)
+Expected byte[2..47] = exact same DMS UTF-8 string, zero-padded
+
+--- INPUT REPORT ID 23: DST Settings ---
+Buffer size: 32 bytes
+Compared against: DST output (report ID 24) with byte[0] = 0
+Expected byte[1] = 32 (array size)
+Expected byte[2..31] = exact same payload that was sent
+
+=== COMPARISON LOGIC ===
+
+1. Software sends all 7 output reports
+2. First read-back: reads all 7 input reports, zeros byte[0] on each
+3. Compares each SENT vs RECEIVED (byte[0] zeroed on both sides)
+4. If ANY block mismatches on first read:
+   - Second read-back: reads all 7 input reports again
+   - Compares SENT vs RECEIVED2
+   - If second read also mismatches: shows error dialog for that block
+5. If first read matched: uses first read data to update UI
+   If first read failed but second matched: uses first read data anyway
+   If both failed: uses first read data and shows error
+
+=== SUMMARY TABLE ===
+
+Output ID -> Input ID   Size    Byte[1] in SENT
+    2     ->     1       24      24
+   12     ->    11       24       0 (not set by encoder!)
+   14     ->    13       24      24
+   16     ->    15       48      48
+   18     ->    17       48      48
+   22     ->    21       48      48
+   24     ->    23       32      32
+
+The FW must store and return the EXACT bytes it received (minus byte[0])
+for the verification to pass. The simplest approach: write the full
+output report payload to flash, read it back into the input report
+buffer, and let byte[0] be whatever the input report ID is.

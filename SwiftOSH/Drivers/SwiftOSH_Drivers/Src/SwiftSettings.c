@@ -55,7 +55,7 @@ uint8_t SwiftSettings_GetWAVFileAttributes(WAVFile_Attributes *wav)
   wav->Filename[wav->FilenameLength] = 0;
 
   wav->SampleRate = *(__IO uint8_t *)((uint32_t)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 2)) * 1000;
-  if (wav->SampleRate != 8000  && wav->SampleRate != 16000 && wav->SampleRate != 24000 &&
+  if (wav->SampleRate != 8000  && wav->SampleRate != 12000 && wav->SampleRate != 16000 && wav->SampleRate != 24000 &&
       wav->SampleRate != 32000 && wav->SampleRate != 48000 && wav->SampleRate != 96000 &&
       wav->SampleRate != 192000)
     wav->SampleRate = 32000;  /* Default/clamp for unprogrammed or unsupported rate */
