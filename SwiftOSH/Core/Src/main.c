@@ -100,6 +100,9 @@ volatile uint8_t g_stop2Allowed = 1;
 /* ---- Battery voltage cache (updated in USB main loop, read by GET_REPORT handler) ---- */
 volatile float g_CachedBatteryVoltage = -1.0f;
 
+/* ---- USB suspend flag — set from PCD callback, checked in main loop ---- */
+volatile uint32_t g_usbSuspendTick = 0;
+
 /* ---- Settings / state variables ---- */
 WAVFile_Attributes WAVFile;
 Swift_Schedule     SwiftSchedule;
@@ -611,11 +614,13 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_SetPriority(EXTI13_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI13_IRQn);
 
-  /* VBUS_SCALED (PA15) — USB detect */
+  /* VBUS_SCALED (PA15) — USB detect, rising-edge EXTI triggers reset into USB mode */
   GPIO_InitStruct.Pin  = VBUS_SCALED_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(VBUS_SCALED_GPIO_Port, &GPIO_InitStruct);
+  HAL_NVIC_SetPriority(EXTI15_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_IRQn);
 
   /* VBAT_SCALED (PA0) — analog input for ADC */
   GPIO_InitStruct.Pin  = VBAT_SCALED_Pin;
@@ -645,6 +650,16 @@ static void MX_GPIO_Init_USB(void)
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(VBAT_SCALED_GPIO_Port, &GPIO_InitStruct);
+
+  /* VBUS_SCALED (PA15) — explicitly init as input with pull-down.
+     When USB is unplugged, VBUS back-feeds ~2.45V through the USB peripheral's
+     internal VDDUSB regulator, holding VBUS_SCALED at ~1.75V. The STM32U5
+     internal pull-down (~40k) combined with R21 (82k) creates a divider that
+     pulls PA15 below the GPIO logic threshold when VBUS is truly gone. */
+  GPIO_InitStruct.Pin  = VBUS_SCALED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(VBUS_SCALED_GPIO_Port, &GPIO_InitStruct);
 
   /* ADC_EN (PB15) and VBAT_MONITOR_EN (PB5) — output, default LOW */
   HAL_GPIO_WritePin(ADC_EN_GPIO_Port, ADC_EN_Pin, GPIO_PIN_RESET);
@@ -761,6 +776,11 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xEventGroupSetBitsFromISR(xEventGroup, NEW_VOICE_MEMO_SIGNAL, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  }
+  /* VBUS rising = USB cable plugged in during recording/standby — reset into USB mode */
+  else if (GPIO_Pin == VBUS_SCALED_Pin)
+  {
+    NVIC_SystemReset();
   }
 }
 
@@ -2003,7 +2023,7 @@ int main(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   GPIO_InitStruct.Pin  = VBUS_SCALED_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(VBUS_SCALED_GPIO_Port, &GPIO_InitStruct);
 
   if (HAL_GPIO_ReadPin(VBUS_SCALED_GPIO_Port, VBUS_SCALED_Pin) == GPIO_PIN_SET)
@@ -2044,6 +2064,18 @@ int main(void)
   /* USB mode main loop — process deferred flash writes and refresh battery cache */
   while (1)
   {
+    /* Check for USB unplug: suspend callback sets g_usbSuspendTick.
+       Wait 500ms for VBUS to fully discharge through R20+R21 (115k),
+       then confirm VBUS_SCALED is low before resetting. */
+    if (g_usbSuspendTick != 0 && (HAL_GetTick() - g_usbSuspendTick) >= 500)
+    {
+      if (HAL_GPIO_ReadPin(VBUS_SCALED_GPIO_Port, VBUS_SCALED_Pin) == GPIO_PIN_RESET)
+      {
+        NVIC_SystemReset();
+      }
+      g_usbSuspendTick = 0;  /* Not a real unplug (host suspend) — clear and continue */
+    }
+
     USB_HID_ProcessFlash();
 
     /* Refresh battery voltage cache every ~10 seconds.

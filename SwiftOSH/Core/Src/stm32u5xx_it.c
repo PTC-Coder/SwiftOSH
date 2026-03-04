@@ -83,6 +83,11 @@ void EXTI13_IRQHandler(void)
   HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
 }
 
+void EXTI15_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);
+}
+
 void GPDMA1_Channel0_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(&hdma_sai1_a);

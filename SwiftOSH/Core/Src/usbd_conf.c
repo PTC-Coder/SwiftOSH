@@ -10,6 +10,7 @@
 #include "usbd_def.h"
 #include "usbd_core.h"
 #include "usbd_customhid.h"
+#include "main.h"
 
 PCD_HandleTypeDef hpcd_USB_DRD_FS;
 void Error_Handler(void);
@@ -95,6 +96,10 @@ void HAL_PCD_ResetCallback(PCD_HandleTypeDef *hpcd)
 void HAL_PCD_SuspendCallback(PCD_HandleTypeDef *hpcd)
 {
   USBD_LL_Suspend((USBD_HandleTypeDef *)hpcd->pData);
+  /* Record the time of suspend — main loop will check VBUS after VBUS has
+     had time to discharge through R20+R21 (115k). Don't block here in ISR. */
+  extern volatile uint32_t g_usbSuspendTick;
+  g_usbSuspendTick = HAL_GetTick();
 }
 
 void HAL_PCD_ResumeCallback(PCD_HandleTypeDef *hpcd)

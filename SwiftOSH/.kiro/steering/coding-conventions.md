@@ -28,7 +28,15 @@
 - Flash programming uses QUADWORD (128-bit / 16-byte) writes on STM32U5
 - **CRITICAL: `FLASH_TYPEPROGRAM_QUADWORD` requires 16-byte aligned addresses.** Writes to non-aligned addresses fail silently (HAL returns error, no data written, no fault). All flash offset constants in `GeneralDefines.h` are padded to multiples of 16. Do NOT add new offsets that are not 16-byte aligned.
 
-## STM32L4 → STM32U5 Porting Notes
+## STM32U5 VBUS Back-Feed (CRITICAL)
+
+On STM32U5, `HAL_PWREx_EnableVddUSB()` (called in `HAL_PCD_MspInit`) enables the VDDUSB power domain. This causes the USB DRD transceiver's internal sensing circuitry to back-feed ~2.45V onto the VBUS line even when the USB cable is unplugged, as long as the board has battery power. This does NOT happen on STM32L4 — it is specific to the STM32U5 VDDUSB architecture.
+
+Symptom: VBUS_SCALED (PA15) reads ~1.75V after USB unplug (2.45V × 82k/115k = 1.75V), which is above the GPIO logic-high threshold, so `HAL_GPIO_ReadPin` returns `GPIO_PIN_SET` even with no cable.
+
+Fix: Configure PA15 with `GPIO_PULLDOWN` everywhere it is initialized (boot-time check in `main()`, `MX_GPIO_Init()`, and `MX_GPIO_Init_USB()`). The internal pull-down (~40kΩ) in parallel with R21 (82k) pulls the node to ~1.0V when only the back-feed is present — below the logic threshold. Real VBUS (3.57V on the pin) easily overcomes the pull-down.
+
+
 
 When porting code from the original SwiftOne (STM32L4R9):
 
