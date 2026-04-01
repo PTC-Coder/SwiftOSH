@@ -145,6 +145,19 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - Uses 8KB `static page_buf` for read-modify-write of entire settings page
 - Renames to `.done`/`.err` after processing
 
+### SD_FW_Update (SD_FW_Update.h / SD_FW_Update.c)
+- `FW_Update_CheckAndApply(battery_voltage)` — scans SD root for `.hex` file, parses Intel HEX into RAM buffer, erases+programs app flash, resets MCU. Does NOT return on success
+- STM32U5 flash: 8KB pages, dual-bank (Bank2 at 0x08040000), 128-bit quadword programming
+- Flash registers: NSKEYR(+0x08), NSSR(+0x20), NSCR(+0x28) at base 0x40022000
+- NSCR bits: PG=0, PER=1, PNB=[10:3], BKER=11, STRT=16, LOCK=31
+- RAM buffer: 200KB in lower SRAM1 (0x20000000) — no SRAM3 on STM32U545
+- Flash updater runs directly from flash with reverse page order (Bank2 page 31 down to Bank1 page 0). When it erases its own page, CPU stalls during erase but resumes after. Final reset via AIRCR
+- Settings page (0x0807E000 = Bank2 page 31) is always skipped during erase+program
+- Battery voltage check: refuses update below 3.2V
+- .hex file deleted from SD before flashing (prevents retry loop on parse errors)
+- Boot sequence position: first SD operation after mount, before SDConfig/SDSchedule/WriteDebugFile
+- WARNING: needs hardware testing — flash self-erase behavior on STM32U5 single-bank-read-during-erase may differ from STM32L4
+
 ## SAI/DMA Audio Recording (CRITICAL)
 
 ### GPDMA Linked-List Mode for Half-Transfer Simulation

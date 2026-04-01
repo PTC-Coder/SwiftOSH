@@ -20,6 +20,7 @@
 #include "LPModes.h"
 #include "SDCardConfig.h"
 #include "SDCardSchedule.h"
+#include "SD_FW_Update.h"
 #include "ff.h"
 #include <stdio.h>
 #include <string.h>
@@ -1002,6 +1003,14 @@ void InitializeFATTask(void const *argument)
     NVIC_SystemReset();
   }
   WriteSystemLog("<FAT Task> SD Card mounted.");
+
+  /* Check for firmware update .hex file on SD card.
+     If found and valid, this does NOT return — MCU resets into new firmware.
+     Must be first SD operation after mount. */
+  {
+    float batt = GetBatteryVoltage();
+    FW_Update_CheckAndApply(batt);
+  }
 
   /* Load settings from SD card .cfg file (if present) — must run before
      settings are read from flash.  Renames to .done/.err. */

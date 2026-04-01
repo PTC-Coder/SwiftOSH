@@ -286,7 +286,7 @@ NVIC_SystemReset();
 ## What Still Needs Porting
 
 - Battery voltage ADC reading — `HAL_ADC_PollForConversion` times out (HAL_TIMEOUT), raw=0. Clock confirmed running at 160MHz, start returns HAL_OK. PA0 configured as analog, `__HAL_RCC_ADC12_CLK_ENABLE()` called in MspInit, PCSEL set automatically by `HAL_ADC_ConfigChannel()`. CR/ISR register values not yet captured from hardware — next step is reading the diagnostic log (`<ADC> clk=... CR=0x... ISR=0x...`) to identify root cause
-- SD firmware update (SD_FW_Update) — too MCU-specific (flash erase/program sequences, page ordering, RAM trampoline) to port without hardware testing
+- ~~SD firmware update (SD_FW_Update)~~ DONE — STM32U5 port with 8KB pages, quadword programming, reverse page order flash updater. Needs hardware verification
 
 ## Features Ported from SwiftOne_FW (latest batch)
 
@@ -296,6 +296,7 @@ NVIC_SystemReset();
 - **Error_Handler with retry counter** — uses `RTC_BKP_DR2` as persistent reboot counter. Logs to flash, reboots up to 5 times, then enters permanent red-blink standby. Counter cleared on successful boot
 - **SD Card Settings Loader** (`SDCardConfig.c`) — loads 248-byte binary `.cfg` file from SD root at boot. Parses 7 blocks (codec, clock, audio, start/stop times, location, DST), writes to settings flash. Renames to `.done`/`.err`
 - **SD Card Schedule Loader** (`SDCardSchedule.c`) — loads plain text `.sch` file from SD root at boot. Parses `schedule=`, `start_date=`, `stop_date=`, `slot=`, `day_skip=`, `on_minutes=`, `off_minutes=`, `cycles=`. Uses read-modify-write on settings flash page. Renames to `.done`/`.err`
+- **SD Card Firmware Update** (`SD_FW_Update.c`) — parses Intel HEX file from SD card into 200KB SRAM1 buffer, erases+programs app flash (skipping settings page), resets MCU. STM32U5 adaptations: 8KB pages, dual-bank, 128-bit quadword programming via FLASH_NSCR/NSSR/NSKEYR, reverse page order (Bank2 page 31 down to Bank1 page 0). Needs hardware verification
 
 ## USB Middleware Modifications
 
