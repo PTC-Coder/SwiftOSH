@@ -26,6 +26,12 @@ uint8_t SwiftSettings_GetCodecVariables(Codec_Config *cfg)
   cfg->Codec_PRB         = *(__IO uint8_t *)(addr++);
   cfg->Codec_MIC_BIAS_CFG = *(__IO uint8_t *)(addr);
 
+  /* DaySkip is at codec byte 14 (offset +3 +11 = +14 from CODEC_SETTINGS_OFFSET) */
+  uint8_t ds = *(__IO uint8_t *)(SETTINGS_BASE_ADDRESS + CODEC_SETTINGS_OFFSET + 14);
+  if (ds == 0xFF) ds = 0;   /* Erased flash = disabled */
+  if (ds > 25) ds = 25;     /* Clamp to reasonable max */
+  cfg->DaySkip = ds;
+
   return 1;
 }
 

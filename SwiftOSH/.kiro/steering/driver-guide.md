@@ -133,6 +133,18 @@ Custom drivers live in `SwiftOSH/Drivers/SwiftOSH_Drivers/`:
 - `LPModes_RestoreClockAfterStop2()` — restores HSE, PLL1, PLL2 (SAI1), SYSCLK after Stop 2
 - Gated by `g_initComplete` and `g_stop2Allowed` flags in main.c
 
+### SDCardConfig (SDCardConfig.h / SDCardConfig.c)
+- `SDConfig_CheckAndApply()` — scans SD root for any `.cfg` file, reads 248-byte binary settings (7 blocks: codec, clock, audio, start/stop times, location, DST), writes to settings flash. Renames to `.done` on success, `.err` on failure
+- File format: each block has byte[0]=reportID, byte[1]=blockSize (multiple of 8), byte[2+]=payload
+- Must run in boot sequence BEFORE settings are read from flash
+- Uses `static` buffers to avoid blowing InitializeFATTask stack
+
+### SDCardSchedule (SDCardSchedule.h / SDCardSchedule.c)
+- `SDSchedule_CheckAndApply()` — scans SD root for any `.sch` file, parses plain text schedule, writes to settings flash via read-modify-write (preserves other settings)
+- Supported keys: `schedule=arbitrary|dutycycle|continuous`, `start_date=YY/MM/DD`, `stop_date=YY/MM/DD`, `day_skip=N`, `slot=HH:MM-HH:MM` (up to 20), `on_minutes=N`, `off_minutes=N`, `cycles=N`
+- Uses 8KB `static page_buf` for read-modify-write of entire settings page
+- Renames to `.done`/`.err` after processing
+
 ## SAI/DMA Audio Recording (CRITICAL)
 
 ### GPDMA Linked-List Mode for Half-Transfer Simulation

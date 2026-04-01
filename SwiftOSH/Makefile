@@ -81,6 +81,8 @@ C_SOURCES = \
   Drivers/SwiftOSH_Drivers/Src/FlashLogging.c \
   Drivers/SwiftOSH_Drivers/Src/StatusLED.c \
   Drivers/SwiftOSH_Drivers/Src/LPModes.c \
+  Drivers/SwiftOSH_Drivers/Src/SDCardConfig.c \
+  Drivers/SwiftOSH_Drivers/Src/SDCardSchedule.c \
   Core/Src/bsp_driver_sd.c \
   Core/Src/sd_diskio.c \
   Core/Src/fatfs.c \

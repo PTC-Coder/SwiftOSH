@@ -286,7 +286,16 @@ NVIC_SystemReset();
 ## What Still Needs Porting
 
 - Battery voltage ADC reading — `HAL_ADC_PollForConversion` times out (HAL_TIMEOUT), raw=0. Clock confirmed running at 160MHz, start returns HAL_OK. PA0 configured as analog, `__HAL_RCC_ADC12_CLK_ENABLE()` called in MspInit, PCSEL set automatically by `HAL_ADC_ConfigChannel()`. CR/ISR register values not yet captured from hardware — next step is reading the diagnostic log (`<ADC> clk=... CR=0x... ISR=0x...`) to identify root cause
-- SD firmware update (SD_FW_Update)
+- SD firmware update (SD_FW_Update) — too MCU-specific (flash erase/program sequences, page ordering, RAM trampoline) to port without hardware testing
+
+## Features Ported from SwiftOne_FW (latest batch)
+
+- **DST flag=0 empty suffix guard** — when `DST_Active_Flag == 0`, suffix is set to empty string to prevent garbage in filenames
+- **CheckAndDumpFlashLogs** — on-demand flash log dump via `dump_flash_logs.cmd` trigger file on SD card root. Writes timestamped `.out` file, erases flash log area
+- **Day-Skip Recording Interval** — record every N days. `g_daySkip` read from codec settings byte 14. `ShouldSkipToday()` called at `END_OF_DAY_SIGNAL` in both `InitializeScheduleTask` and `StandbyTask`. Button override bypasses day-skip
+- **Error_Handler with retry counter** — uses `RTC_BKP_DR2` as persistent reboot counter. Logs to flash, reboots up to 5 times, then enters permanent red-blink standby. Counter cleared on successful boot
+- **SD Card Settings Loader** (`SDCardConfig.c`) — loads 248-byte binary `.cfg` file from SD root at boot. Parses 7 blocks (codec, clock, audio, start/stop times, location, DST), writes to settings flash. Renames to `.done`/`.err`
+- **SD Card Schedule Loader** (`SDCardSchedule.c`) — loads plain text `.sch` file from SD root at boot. Parses `schedule=`, `start_date=`, `stop_date=`, `slot=`, `day_skip=`, `on_minutes=`, `off_minutes=`, `cycles=`. Uses read-modify-write on settings flash page. Renames to `.done`/`.err`
 
 ## USB Middleware Modifications
 

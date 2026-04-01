@@ -80,6 +80,7 @@ The `.cproject` is configured for STM32CubeIDE v1.17.0+ managed build with:
 - `get_fattime()` in fatfs.c reads RTC for file timestamps
 - `AudioFiles_MountSDCard()` links the SD driver and mounts the volume — called from InitializeFATTask
 - Recording flow: StandbyTask creates directories/files via AudioFiles, RecordLoopTask writes DMA buffers via f_write, WAV header written on file close
+- Boot sequence in InitializeFATTask: SD mount (with retry) → SDConfig_CheckAndApply (.cfg) → SDSchedule_CheckAndApply (.sch) → WriteDebugFile → WriteSystemFlashLogToSD → CheckAndDumpFlashLogs → battery check → codec init → read settings → DST init → StatusLED init → create schedule task
 
 ## FreeRTOS
 
@@ -131,6 +132,14 @@ The original SwiftOne firmware was used as a reference during porting. The Swift
 - `HardFault_Handler` in `stm32u5xx_it.c` blinks RED LED (PC1) via raw register writes — essential for debugging, do NOT revert to `while(1){}`
 - SVC_Handler, PendSV_Handler, SysTick_Handler are provided by the FreeRTOS CM33 port via `#define` mappings in `FreeRTOSConfig.h` — do NOT define them in `stm32u5xx_it.c`
 - The startup assembly (`startup_stm32u545retxq.s`) disables SysTick, clears pending PendSV/SysTick, calls SystemInit, copies `.data`, zeros `.bss`, then calls main
+- Default flash configuration data at 0x0807E000 via `swift_defaults.c` — config utility reads valid defaults on fresh chip
+- RTC preserved across reboots via backup register magic number (0x32F2 in DR0) — `MX_RTC_Init()` skips `HAL_RTC_Init()` when RTC already running
+- USB SET_REPORT fixed — uses `pClassDataCmsit[classId]` (not `pClassData`) to access report buffer
+- DST suffix guard: when DST disabled (flag=0), empty suffix prevents filename corruption
+- On-demand flash log dump via `dump_flash_logs.cmd` trigger file on SD card
+- Day-skip recording interval: record every N days, configured via codec settings byte 14
+- Error_Handler with retry counter: reboots up to 5 times via RTC_BKP_DR2, then permanent red blink
+- SD card .cfg settings loader and .sch schedule loader for field configuration without USB
 
 ## Bring-Up Findings So Far
 
@@ -229,5 +238,14 @@ Current implementation:
 14. ~~Pushbutton long-press detection~~ DONE — EXTI + ButtonTask, 1.5s hold, solid blue feedback
 15. ~~Translate USB HID codec settings to TLV320ADC3120 register format~~ DONE — gain (0.5dB steps, clamped to 84), mic bias (0x10→2.5V, 0x18→3.3V), sample rate auto-detected by codec
 16. ~~Fix sample rate support~~ DONE — all rates (8/12/16/24/32/48/96/192 kHz) working. PLL2 reconfigured dynamically via `MX_SAI1_ReconfigPLL2(fs)` using a 3-step sequence: (1) switch SAI1 to HSI16, (2) disable PLL2 via `__HAL_RCC_PLL2_DISABLE()` + poll `RCC_FLAG_PLL2RDY`, (3) reconfigure PLL2 M=1/N=32/P=4 → 98.304 MHz and switch SAI1 back. `MckOverSampling` is DISABLE for ≤24kHz and ENABLE for ≥32kHz — the SAI MCKDIV register is 6-bit (max 63); without this split, 8/16/24kHz would require MCKDIV > 63 and HAL_SAI_Init hits Error_Handler. 12kHz uses `SAI_AUDIO_FREQUENCY_MCKDIV` with `Mckdiv=32`. `BUFFER_SIZE = 131068` bytes (two nodes of 65534 bytes each — the GPDMA CBR1.BNDT 16-bit max). `FORCE_SAMPLE_RATE` define in `main.c` allows compile-time rate override for testing. `g_dmaWarmupSkip = 2` discards the first two DMA signals after each recording start to eliminate the pre-lock silence gap.
-17. ~~Port SD firmware update (SD_FW_Update) from SwiftOne~~
+17. ~~Port SD firmware update (SD_FW_Update) from SwiftOne~~ NOT PORTED — too MCU-specific (flash erase/program, page ordering, RAM trampoline) for blind port; needs hardware testing
 18. ~~USB hot-plug: plug in during recording/standby → resets into USB mode; unplug with battery power → resets back into recording mode~~ DONE — EXTI15 rising edge on VBUS_SCALED triggers reset into USB mode; HAL_PCD_SuspendCallback sets g_usbSuspendTick, main loop confirms VBUS low after 500ms then resets. GPIO_PULLDOWN required on PA15 to overcome STM32U5 VDDUSB back-feed (~1.75V when unplugged with battery power)
+19. ~~Port default flash configuration data~~ DONE — `swift_defaults.c` places 632-byte config array in `.swift_settings` linker section at 0x0807E000
+20. ~~Fix USB SET_REPORT (pClassData vs pClassDataCmsit)~~ DONE — newer USB library stores class data in `pClassDataCmsit[classId]`, not `pClassData`
+21. ~~Fix RTC reset on every boot~~ DONE — `MX_RTC_Init()` now checks `RTC_BKP_DR0` for magic `0x32F2` before calling `HAL_RTC_Init()`; preserves battery-backed time across reboots
+22. ~~DST flag=0 empty suffix guard~~ DONE — when `DST_Active_Flag == 0`, suffix set to empty string to prevent garbage in filenames
+23. ~~On-demand flash log dump (CheckAndDumpFlashLogs)~~ DONE — trigger via `dump_flash_logs.cmd` on SD root
+24. ~~Day-skip recording interval~~ DONE — `g_daySkip` from codec byte 14, `ShouldSkipToday()` at END_OF_DAY handlers
+25. ~~Error_Handler with retry counter~~ DONE — `RTC_BKP_DR2` reboot counter, 5 attempts then permanent red blink
+26. ~~SD card settings loader (.cfg)~~ DONE — `SDCardConfig.c`, 248-byte binary format, 7 blocks
+27. ~~SD card schedule loader (.sch)~~ DONE — `SDCardSchedule.c`, plain text key=value format, read-modify-write flash

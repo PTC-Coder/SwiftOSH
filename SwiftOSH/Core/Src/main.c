@@ -18,6 +18,8 @@
 #include "FlashLogging.h"
 #include "StatusLED.h"
 #include "LPModes.h"
+#include "SDCardConfig.h"
+#include "SDCardSchedule.h"
 #include "ff.h"
 #include <stdio.h>
 #include <string.h>
@@ -110,6 +112,10 @@ SWIFT_ERRORS       SwiftErrors;
 DST_Settings       DSTSettings;
 unsigned int       BufferWritesPerFile;
 
+/* ---- Day-skip recording interval ---- */
+static uint8_t  g_daySkip = 0;        /* 0=disabled, N=record every Nth day */
+static uint8_t  g_daySkipCounter = 0; /* counts midnights since last recording day */
+
 /* ---- FatFS file objects (static to save stack in tasks) ---- */
 static FIL FsFile;
 static FIL VoiceMemoFile;
@@ -142,6 +148,8 @@ void ButtonTask(void const *argument);
 static void InitializeCodecAndDMA(void);
 static void WriteSystemLog(const char *inputString);
 static void WriteSystemFlashLogToSD(void);
+static void CheckAndDumpFlashLogs(void);
+static uint8_t ShouldSkipToday(void);
 static void WriteDebugFile(void);
 
 /* Set from ISR, logged from task context to avoid flash writes in ISR */
@@ -995,11 +1003,25 @@ void InitializeFATTask(void const *argument)
   }
   WriteSystemLog("<FAT Task> SD Card mounted.");
 
+  /* Load settings from SD card .cfg file (if present) — must run before
+     settings are read from flash.  Renames to .done/.err. */
+  SDConfig_CheckAndApply();
+
+  /* Load schedule from SD card .sch file (if present) — must run before
+     settings are read from flash.  Renames to .done/.err. */
+  SDSchedule_CheckAndApply();
+
   /* Write debug file */
   WriteDebugFile();
 
   /* Dump flash logs to SD, then erase flash log area */
   WriteSystemFlashLogToSD();
+
+  /* On-demand flash log dump: if dump_flash_logs.cmd exists on SD, dump
+     all flash log entries to a timestamped .out file and erase flash log area.
+     WARNING: this disables SDMMC1 clock at the end — all SD access must
+     happen before this call in the boot sequence. */
+  CheckAndDumpFlashLogs();
 
   /* Check battery voltage before proceeding */
   {
@@ -1034,8 +1056,24 @@ void InitializeFATTask(void const *argument)
   SwiftSettings_GetSwiftSchedule(&SwiftSchedule);
   SwiftSettings_GetDSTSettings(&DSTSettings);
 
-  /* Initialize DST */
-  RTC_InitiateDST(&DSTSettings);
+  /* Read day-skip interval from codec settings byte 14 */
+  {
+    Codec_Config tmpCodec;
+    SwiftSettings_GetCodecVariables(&tmpCodec);
+    g_daySkip = tmpCodec.DaySkip;
+  }
+
+  /* Initialize DST — when flag is 0 (disabled), use empty suffix so
+     filenames don't get garbage appended from uninitialized pointers */
+  if (DSTSettings.DST_Active_Flag == 0)
+  {
+    static uint8_t empty_suffix[] = "";
+    DSTSettings.DST_Suffix_To_Use = empty_suffix;
+  }
+  else
+  {
+    RTC_InitiateDST(&DSTSettings);
+  }
 
   /* Initialize StatusLED */
   StatusLED_Initialize();
@@ -1294,6 +1332,13 @@ void StandbyTask(void const *argument)
     }
     else if (uxBits & END_OF_DAY_SIGNAL)
     {
+      /* Day-skip check */
+      if (ShouldSkipToday())
+      {
+        WriteSystemLog("<ISchedule Task> Day-skip: skipping today");
+        continue;
+      }
+
       uint8_t returnFlag = RTC_CheckIfBetweenDates(SwiftSchedule.StartDate, SwiftSchedule.StopDate);
 
       if (returnFlag == 1)
@@ -1657,6 +1702,94 @@ static void WriteSystemFlashLogToSD(void)
 }
 
 /**
+  * @brief  On-demand flash log dump.  If dump_flash_logs.cmd exists on SD,
+  *         dump all flash log entries to a timestamped .out file, erase flash
+  *         log area, then disable SDMMC1 clock.
+  */
+static void CheckAndDumpFlashLogs(void)
+{
+  static FIL DumpFile;
+  UINT bw;
+  char StringBuffer[200];
+  uint8_t StringLength;
+  char read_buffer[MAX_STRING_LENGTH];
+  char filename[40];
+  char datetime[16];
+
+  /* Check if the trigger file exists */
+  if (f_stat("0:/dump_flash_logs.cmd", NULL) != FR_OK)
+    return;
+
+  /* Delete trigger file so it doesn't fire again */
+  f_unlink("0:/dump_flash_logs.cmd");
+
+  /* Build output filename: Flash_logs_YYYYMMDD_hhmmss.out */
+  RTC_ReturnDateTimeFileName(datetime);
+  snprintf(filename, sizeof(filename), "0:/Flash_logs_%s.out", datetime);
+
+  if (f_open(&DumpFile, filename, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
+    return;
+
+  /* Write header */
+  StringLength = snprintf(StringBuffer, sizeof(StringBuffer), "=== Flash Log Dump ===\r\n");
+  f_write(&DumpFile, StringBuffer, StringLength, &bw);
+
+  RTC_ReturnDateTimeString(StringBuffer);
+  f_write(&DumpFile, StringBuffer, 32, &bw);
+
+  StringLength = snprintf(StringBuffer, sizeof(StringBuffer), "\r\n======================\r\n\r\n");
+  f_write(&DumpFile, StringBuffer, StringLength, &bw);
+
+  /* Walk through all flash log entries */
+  uint32_t current_addr = FLASH_USER_START_ADDR;
+  while (current_addr < FLASH_USER_END_ADDR)
+  {
+    if (Flash_IsEmpty(current_addr, 16))
+      break;
+
+    uint32_t string_length = *((uint32_t *)current_addr);
+    if (string_length == 0 || string_length > MAX_STRING_LENGTH)
+      break;
+
+    if (Flash_ReadString(current_addr, read_buffer, sizeof(read_buffer)) == FLASH_OK)
+    {
+      StringLength = snprintf(StringBuffer, sizeof(StringBuffer), "%s", read_buffer);
+      f_write(&DumpFile, StringBuffer, StringLength, &bw);
+    }
+
+    uint32_t entry_size = 16 + ((string_length + 15) & ~15);
+    current_addr += entry_size;
+  }
+
+  f_close(&DumpFile);
+  Flash_ErasePage(FLASH_USER_START_ADDR, FLASH_USER_END_ADDR);
+}
+
+/**
+  * @brief  Check if today should be skipped based on day-skip interval.
+  * @retval 1 = skip today, 0 = record today
+  */
+static uint8_t ShouldSkipToday(void)
+{
+  if (g_daySkip <= 1) return 0;  /* 0 or 1 = record every day */
+
+  /* If start date is default (Year=0 → 1/1/2000), use DOY-based spacing */
+  if (SwiftSchedule.StartDate.Year == 0)
+  {
+    return (DSTSettings.Current_DOY % g_daySkip != 1) ? 1 : 0;
+  }
+
+  /* User-configured start date: use counter */
+  g_daySkipCounter++;
+  if (g_daySkipCounter >= g_daySkip)
+  {
+    g_daySkipCounter = 0;
+    return 0;  /* Record today */
+  }
+  return 1;  /* Skip today */
+}
+
+/**
   * @brief  InitializeScheduleTask — full port from SwiftOne.
   */
 void InitializeScheduleTask(void const *argument)
@@ -1700,6 +1833,13 @@ void InitializeScheduleTask(void const *argument)
 
       if (uxBits & END_OF_DAY_SIGNAL)
       {
+        /* Day-skip check: if today should be skipped, go back to standby */
+        if (ShouldSkipToday())
+        {
+          WriteSystemLog("<ISchedule> Day-skip: skipping today");
+          continue;
+        }
+
         uint8_t returnFlag = RTC_CheckIfBetweenDates(SwiftSchedule.StartDate, SwiftSchedule.StopDate);
         if (returnFlag == 1)
         {
@@ -1969,27 +2109,47 @@ void Error_Handler(void)
 {
   __disable_irq();
 
-  /* Safe fallback: manually blink RED LED (PC1) using GPIO registers directly.
-     This works even if no clocks or peripherals have been initialized yet,
-     because GPIOC clock may already be on from VBUS check or GPIO init.
-     If not, we enable it here. */
+  /* Try to log the error to flash — safe even if flash logging isn't fully
+     initialized, WriteFlashNextEntry checks internally */
+  WriteFlashNextEntry("*** Error_Handler called ***\r\n");
+
+  /* Use RTC backup register DR2 as a retry counter (survives NVIC_SystemReset).
+     After 5 failed attempts, enter permanent red-blink standby. */
+  uint32_t retryCount = 0;
+
+  /* Only read/write backup registers if RTC clock is likely running
+     (check if the magic number in DR0 is set — means RTC was initialized) */
+  if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) == 0x32F2U)
+  {
+    retryCount = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
+    retryCount++;
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, retryCount);
+
+    if (retryCount < 5)
+    {
+      __enable_irq();
+      NVIC_SystemReset();
+      while (1) {}  /* Should not reach here */
+    }
+
+    /* 5 failures — reset counter for next power cycle */
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, 0);
+  }
+
+  /* Permanent error: blink RED LED via raw register access */
   RCC->AHB2ENR1 |= RCC_AHB2ENR1_GPIOCEN;
-  /* Small delay for clock to stabilize */
   volatile uint32_t dummy = RCC->AHB2ENR1;
   (void)dummy;
 
-  /* PC1 = output push-pull */
   GPIOC->MODER   = (GPIOC->MODER & ~(3UL << (1 * 2))) | (1UL << (1 * 2));
   GPIOC->OTYPER &= ~(1UL << 1);
   GPIOC->OSPEEDR &= ~(3UL << (1 * 2));
 
-  /* Blink RED LED forever — visible proof we hit Error_Handler
-     RED (PC1) is active-high: HIGH = on, LOW = off */
   while (1)
   {
-    GPIOC->BSRR = (1UL << 1);       /* PC1 high = RED on */
+    GPIOC->BSRR = (1UL << 1);
     for (volatile uint32_t i = 0; i < 200000; i++) {}
-    GPIOC->BSRR = (1UL << (1 + 16)); /* PC1 low = RED off */
+    GPIOC->BSRR = (1UL << (1 + 16));
     for (volatile uint32_t i = 0; i < 200000; i++) {}
   }
 }

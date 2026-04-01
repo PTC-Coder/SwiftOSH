@@ -21,6 +21,7 @@ typedef struct {
   uint8_t Codec_PLL_D_LSB;
   uint8_t Codec_PLL_PR;
   uint8_t Codec_MIC_BIAS_CFG;
+  uint8_t DaySkip;            /* Record every N days: 0=disabled, 2=every 2nd day, etc. */
 } Codec_Config;
 
 typedef struct {
